@@ -12,7 +12,7 @@
 - **Friday schedule extended:** Working until ~4 AM (not 1 AM). More milestones achievable Friday night.
 - **Deck share link format confirmed:** `https://link.clashroyale.com/deck/en?deck=26000002;26000001;...` — stable, deterministic, stays primary
 - **Dev device prep added:** Strip Samsung bloat, disable battery optimization as pre-M0 step
-- **Narrative upgraded:** Accessibility angle, "$300 mid-range phone", 4K trailer, polished UI emphasis
+- **Narrative upgraded:** Voice companion pitch, "$300 mid-range phone", 4K trailer, polished UI emphasis
 - **Game audio:** Confirmed non-issue. VAD handles it. Mute for demo as nice-to-have.
 
 ---
@@ -49,7 +49,7 @@
 
 ## What It Is
 
-**Clash Companion** is an Android overlay app that lets you play Clash Royale using voice commands. It sits on top of the game, listens to your voice, interprets commands, and executes card placements by injecting touch events through Android's Accessibility Service. It is also an **accessibility tool** — enabling players with motor impairments to play competitively using only their voice.
+**Clash Companion** is an Android overlay app that lets you play Clash Royale using voice commands. It sits on top of the game, listens to your voice, interprets commands, and executes card placements by injecting touch events through Android's Accessibility Service.
 
 ## Why It Wins
 
@@ -1362,9 +1362,8 @@ Emergency fixes only. No new features.
 - "queue hog at the bridge" → auto-plays when card cycles in
 - "Buffer commands. Set conditional rules. Hands-free gameplay."
 
-### Accessibility Angle (15 seconds)
-- "Originally designed as an **accessibility tool** — enabling players with motor impairments to play Clash Royale competitively using only their voice."
-- This reframes from "game automation" to "inclusive gaming" — much stronger pitch for Supercell judges.
+### Positioning (15 seconds)
+- "Voice companion overlay — not a fully autonomous bot."
 
 ### Closing (15 seconds)
 - Architecture diagram briefly
@@ -1392,9 +1391,6 @@ Emergency fixes only. No new features.
 > Five-tier AI routing system combining on-device speech recognition,
 > computer vision, and cloud LLM strategic reasoning. Running on a
 > $300 mid-range Android phone.
-
-> 🎯 Originally designed as an accessibility tool for players with
-> motor impairments.
 
 ## 📱 Demo Video
 [4K trailer embed/link]
@@ -1548,7 +1544,7 @@ Budget is unlimited. Irrelevant but noted for completeness.
 
 # APPENDIX B: THE NARRATIVE (FOR JUDGES)
 
-> "**Clash Companion** uses a five-tier AI routing system to play Clash Royale by voice — built as an accessibility tool that lets anyone play competitively, hands-free.
+> "**Clash Companion** uses a five-tier AI routing system to play Clash Royale by voice — a voice-controlled companion for hands-free gameplay.
 >
 > Before each match, **Claude Opus** analyzes your specific deck and generates a strategic playbook. During gameplay, simple commands execute in **170 milliseconds** using on-device Moonshine speech recognition. Spell targeting uses **real-time YOLO vision** to track moving troops. Strategic commands use **Claude Haiku** with the Opus playbook to make pro-level decisions in under a second.
 >
