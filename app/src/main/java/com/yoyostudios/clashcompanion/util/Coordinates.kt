@@ -55,6 +55,10 @@ object Coordinates {
         "right" to RIGHT_BRIDGE,
         "right bridge" to RIGHT_BRIDGE,
         "bridge right" to RIGHT_BRIDGE,
+        "wright" to RIGHT_BRIDGE,
+        "wright bridge" to RIGHT_BRIDGE,
+        "right tower" to RIGHT_BRIDGE,
+        "left tower" to LEFT_BRIDGE,
         "center" to CENTER,
         "middle" to CENTER,
         "mid" to CENTER,
@@ -72,5 +76,6 @@ object Coordinates {
         "back" to BACK_CENTER,
         "back center" to BACK_CENTER,
         "behind king" to BACK_CENTER,
+        "bridge" to LEFT_BRIDGE,
     )
 }

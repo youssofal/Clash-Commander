@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Gravity
@@ -17,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.yoyostudios.clashcompanion.accessibility.ClashCompanionAccessibilityService
 import com.yoyostudios.clashcompanion.capture.ScreenCaptureService
+import com.yoyostudios.clashcompanion.command.CommandRouter
 import com.yoyostudios.clashcompanion.speech.SpeechService
 import com.yoyostudios.clashcompanion.util.Coordinates
 
@@ -29,6 +32,27 @@ class OverlayManager(private val context: Context) {
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var overlayView: View? = null
     private var statusText: TextView? = null
+    private var layoutParams: WindowManager.LayoutParams? = null
+    private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * Make overlay transparent to ALL touches (including dispatchGesture).
+     * Call before injecting taps so the overlay doesn't intercept them.
+     */
+    fun setPassthrough(enabled: Boolean) {
+        val params = layoutParams ?: return
+        val view = overlayView ?: return
+        if (enabled) {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        }
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update overlay passthrough: ${e.message}")
+        }
+    }
 
     fun show() {
         if (overlayView != null) return
@@ -78,8 +102,12 @@ class OverlayManager(private val context: Context) {
                 }
                 val (sx, sy) = Coordinates.CARD_SLOT_1
                 val (zx, zy) = Coordinates.LEFT_BRIDGE
+                // Enable passthrough so zone tap doesn't hit the overlay
+                setPassthrough(true)
                 svc.playCard(sx, sy, zx, zy)
                 updateStatus("Playing slot 1 -> left bridge")
+                // Restore touchability after gesture completes
+                handler.postDelayed({ setPassthrough(false) }, 500)
             }
         }
         layout.addView(btnPlayCard)
@@ -96,8 +124,10 @@ class OverlayManager(private val context: Context) {
                 }
                 val (sx, sy) = Coordinates.CARD_SLOT_2
                 val (zx, zy) = Coordinates.RIGHT_BRIDGE
+                setPassthrough(true)
                 svc.playCard(sx, sy, zx, zy)
                 updateStatus("Playing slot 2 -> right bridge")
+                handler.postDelayed({ setPassthrough(false) }, 500)
             }
         }
         layout.addView(btnPlayCard2)
@@ -115,7 +145,7 @@ class OverlayManager(private val context: Context) {
                 }
                 if (!isListening) {
                     svc.onTranscript = { text, latencyMs ->
-                        updateStatus("STT: '$text' (${latencyMs}ms)")
+                        CommandRouter.handleTranscript(text, latencyMs)
                     }
                     svc.startListening()
                     text = "Stop Listening"
@@ -172,8 +202,10 @@ class OverlayManager(private val context: Context) {
             y = 200
         }
 
+        layoutParams = params
         overlayView = layout
         windowManager.addView(layout, params)
+        CommandRouter.overlay = this
         Log.i(TAG, "Overlay shown")
     }
 
@@ -182,6 +214,7 @@ class OverlayManager(private val context: Context) {
             windowManager.removeView(it)
             overlayView = null
             statusText = null
+            layoutParams = null
             Log.i(TAG, "Overlay hidden")
         }
     }
