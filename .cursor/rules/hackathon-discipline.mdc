@@ -1,0 +1,24 @@
+---
+description: Hackathon scope and time discipline
+alwaysApply: true
+---
+
+# Hackathon Discipline
+
+- 48-hour solo build. Working code over perfect code.
+- Follow the milestone plan in docs/clash-companion-final-plan-v2.md
+- Commit after every working milestone
+- Write complete, runnable code — no TODO stubs
+- If a task exceeds 1.5x its time estimate, flag it
+- The deliverable is a video demo (editable) + public GitHub repo
+
+## Scope Triage
+- MUST SHIP: Tap injection, screen capture, STT, parser, Fast Path, pHash hand detection, Queue Path, polished overlay
+- SHOULD SHIP: Deck loading + Opus playbook, Smart Path (Haiku)
+- CUT IF BEHIND SAT 6 PM: Roboflow targeting + conditional triggers
+
+## Out of Scope
+- Multiple games, on-device YOLO, on-device LLM, iOS
+- Custom vision model training, automatic elixir reading
+- Backend/database — no Supabase, keys live in local.properties
+- Hotword biasing (transducer-only in sherpa-onnx, not available for Moonshine)

@@ -1,0 +1,21 @@
+# Build outputs
+build/
+app/build/
+.gradle/
+*.apk
+
+# Large model files
+app/src/main/assets/moonshine-base/
+app/src/main/assets/silero-vad/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# Test screenshots
+clash_test*.png
+
+# OS
+.DS_Store
+Thumbs.db

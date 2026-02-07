@@ -1,0 +1,16 @@
+---
+description: Kotlin and Android patterns for this project
+globs: "**/*.kt,**/*.kts"
+---
+
+# Kotlin / Android Patterns
+
+- Coroutines for async (Dispatchers.IO for network/disk, Dispatchers.Main for UI)
+- OkHttp for HTTP (Anthropic API, Roboflow API)
+- Gson for JSON parsing
+- XML layouts + WindowManager for overlays (no Jetpack Compose)
+- foregroundServiceType="microphone" on audio capture service
+- Accessibility Service may run in separate process — use broadcast or shared state for cross-service communication
+- All pixel coordinates are for 1080x2340 (Samsung A35) — hardcode them
+- Error handling: try-catch with Log.e(TAG, ...), fail gracefully
+- Package: com.yoyostudios.clashcompanion

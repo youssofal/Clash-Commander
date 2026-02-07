@@ -1,0 +1,27 @@
+---
+description: Core project context for Clash Companion
+alwaysApply: true
+---
+
+# Clash Companion — Project Context
+
+Android overlay app for Clash Royale voice control. Supercell AI Hackathon, 48h solo build.
+
+## Device Target
+- Samsung Galaxy A35, Exynos 1380, 8GB RAM, 1080x2340, Android 16, One UI 8.0
+- All pixel coordinates hardcoded to 1080x2340
+
+## Tech Stack
+- Kotlin, Gradle KTS, XML layouts (no Jetpack Compose)
+- On-device STT: sherpa-onnx + Moonshine Base (62M params)
+- On-device VAD: Silero VAD (bundled with sherpa-onnx)
+- Hand detection: pHash correlation (pure Kotlin, no OpenCV)
+- Arena vision: Roboflow hosted API (cloud, not on-device YOLO)
+- Real-time strategy: Claude Haiku 4.5 (cloud)
+- Pre-match analysis: Claude Opus 4.6 (cloud, one-time)
+- Input injection: Accessibility Service + dispatchGesture()
+- Screen capture: MediaProjection API
+
+## API Keys
+- Stored in local.properties (git-ignored)
+- Exposed via BuildConfig.ANTHROPIC_API_KEY and BuildConfig.ROBOFLOW_API_KEY

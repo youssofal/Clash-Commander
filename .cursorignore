@@ -1,0 +1,16 @@
+﻿# Build outputs
+build/
+app/build/
+.gradle/
+*.apk
+
+# Large model files
+app/src/main/assets/moonshine-base/
+app/src/main/assets/silero-vad/
+
+# IDE
+.idea/
+*.iml
+
+# Secrets
+local.properties

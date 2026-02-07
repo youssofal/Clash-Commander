@@ -1,0 +1,24 @@
+---
+description: Anthropic and Roboflow API reference
+globs: "**/api/**,**/network/**,**/strategy/**"
+---
+
+# API Integration Reference
+
+## Anthropic (Claude)
+- Direct HTTP via OkHttp, no SDK
+- Endpoint: POST https://api.anthropic.com/v1/messages
+- Headers: x-api-key, anthropic-version: 2023-06-01, content-type: application/json
+- Opus model string: "claude-opus-4-6-20250116"
+- Haiku model string: "claude-haiku-4-5-20241022"
+- Haiku: request structured JSON output, must respond <800ms
+- API key: BuildConfig.ANTHROPIC_API_KEY
+
+## Roboflow
+- Direct HTTP via OkHttp
+- Endpoint: POST https://detect.roboflow.com/{model_id}/{version}
+- Body: base64-encoded cropped arena image
+- Query params: api_key, confidence (0.4 default)
+- Test models: MinesBot first, Nejc Zavodnik as backup
+- Response: predictions array with class, confidence, x, y, width, height
+- API key: BuildConfig.ROBOFLOW_API_KEY

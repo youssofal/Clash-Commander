@@ -1,0 +1,39 @@
+---
+description: Five-tier command routing architecture
+alwaysApply: true
+---
+
+# Five-Tier Command Routing
+
+Commands route most-specific to least-specific:
+
+1. **Conditional** — "if [troop] [action]" — Roboflow watch + auto-trigger (~400ms + wait)
+2. **Queue** — "queue/next [card] [zone]" — pHash hand watch + auto-play (~170ms + wait)
+3. **Targeting** — "[spell] the [troop]" — Roboflow locate + place spell (~400-600ms)
+4. **Fast Path** — "[card] [zone]" — fuzzy match + pHash slot + tap (~170ms, fully on-device)
+5. **Smart Path** — ambiguous/strategic intent — Claude Haiku + Opus playbook (~700-1000ms)
+
+## Core Services
+- `ClashCompanionAccessibilityService` — tap injection via safeTap(), touch-state gated
+- `ScreenCaptureService` — MediaProjection frame buffer
+- `SpeechService` — sherpa-onnx STT pipeline
+- `HandDetector` — pHash card-in-hand scanning (~5 FPS, <5ms)
+- `ArenaDetector` — Roboflow polling + detection cache (~1-2 FPS)
+- `CommandRouter` — parses transcript, routes to correct tier
+- `CommandParser` — fuzzy matching + alias dictionary
+- `DeckManager` — deck share link parsing, cr-api-data lookup, Opus playbook
+- `OverlayManager` — WindowManager overlay UI
+
+## safeTap()
+All touch injection must go through safeTap() which includes a touch-state gate to prevent simultaneous gesture conflicts. Never call raw dispatchGesture().
+
+## Confidence Gating
+Gate on parser match similarity (Levenshtein score), NOT on STT confidence — sherpa-onnx with Moonshine does not provide calibrated confidence scores. Threshold scales with elixir cost (0.85 for 5+, 0.70 for 3-4, 0.60 for 1-2).
+
+## pHash Hand Detection — Dim Card Handling
+Cards are dimmed/greyed when elixir is insufficient. Brightness-normalize every crop before correlation: subtract mean, divide by std. Apply to both stored templates and live crops. Without this, hand detection fails on dim cards.
+
+## Scope Triage
+- MUST SHIP: M0-M3, M6, M7 (Fast Path + Queue Path + polished overlay)
+- SHOULD SHIP: M4/5, M8 (Deck loading + Smart Path)
+- CUT IF BEHIND SAT 6 PM: M9 (Roboflow targeting/conditional). Demo targeting on slow/stationary targets only if attempted.
