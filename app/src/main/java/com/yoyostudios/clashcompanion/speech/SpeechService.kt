@@ -224,11 +224,9 @@ class SpeechService : Service() {
 
                     Log.i(TAG, "STT: VAD detected speech, ${segmentSamples.size} samples (${segmentSamples.size * 1000 / SAMPLE_RATE}ms)")
 
-                    // Pad with 300ms silence before and after (improves short-utterance accuracy)
+                    // Pad with 300ms silence before and after (encoder needs silence context)
                     val padded = FloatArray(SILENCE_PADDING_SAMPLES + segmentSamples.size + SILENCE_PADDING_SAMPLES)
                     System.arraycopy(segmentSamples, 0, padded, SILENCE_PADDING_SAMPLES, segmentSamples.size)
-
-                    Log.i(TAG, "STT: Padded to ${padded.size} samples (${padded.size * 1000 / SAMPLE_RATE}ms)")
 
                     // Run transcription
                     val transcribeStart = System.currentTimeMillis()
