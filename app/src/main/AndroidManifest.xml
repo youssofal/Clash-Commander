@@ -13,6 +13,9 @@
     <!-- Microphone for voice commands -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Internet for Anthropic API (Opus/Haiku) and Roboflow -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:allowBackup="false"
         android:label="Clash Companion"
@@ -27,6 +30,21 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Receive shared text from CR share sheet -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!-- Direct deck link open -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="link.clashroyale.com" android:pathPrefix="/deck" />
             </intent-filter>
         </activity>
 

@@ -73,7 +73,40 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="6. Start Overlay"
-            android:layout_marginBottom="6dp" />
+            android:layout_marginBottom="16dp" />
+
+        <!-- Deck Info Section -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Deck"
+            android:textSize="18sp"
+            android:textColor="#E0E0E0"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/deckInfoText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No deck loaded. Share a deck from Clash Royale."
+            android:textSize="12sp"
+            android:textColor="#B0B0B0"
+            android:fontFamily="monospace"
+            android:background="#16213E"
+            android:padding="12dp"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/opusStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#8BC34A"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:layout_marginBottom="16dp" />
 
     </LinearLayout>
 </ScrollView>
