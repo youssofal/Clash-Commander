@@ -127,14 +127,17 @@ object HandDetector {
     fun toColorHash(bitmap: Bitmap): FloatArray {
         val scaled = Bitmap.createScaledBitmap(bitmap, HASH_SIZE, HASH_SIZE, true)
         val result = FloatArray(HASH_LEN)
-        for (y in 0 until HASH_SIZE) {
-            for (x in 0 until HASH_SIZE) {
-                val pixel = scaled.getPixel(x, y)
-                val idx = (y * HASH_SIZE + x) * HASH_CHANNELS
-                result[idx] = ((pixel shr 16) and 0xFF).toFloat()     // R
-                result[idx + 1] = ((pixel shr 8) and 0xFF).toFloat()  // G
-                result[idx + 2] = (pixel and 0xFF).toFloat()           // B
-            }
+        val pixels = IntArray(HASH_SIZE * HASH_SIZE)
+        scaled.getPixels(pixels, 0, HASH_SIZE, 0, 0, HASH_SIZE, HASH_SIZE)
+        var p = 0
+        var i = 0
+        while (p < pixels.size) {
+            val pixel = pixels[p]
+            result[i] = ((pixel shr 16) and 0xFF).toFloat()     // R
+            result[i + 1] = ((pixel shr 8) and 0xFF).toFloat()  // G
+            result[i + 2] = (pixel and 0xFF).toFloat()          // B
+            p++
+            i += 3
         }
         if (scaled !== bitmap) scaled.recycle()
         return result
@@ -157,40 +160,43 @@ object HandDetector {
 
         var chromaPixels = 0
 
-        for (y in 0 until HASH_SIZE) {
-            for (x in 0 until HASH_SIZE) {
-                val pixel = scaled.getPixel(x, y)
-                val r = ((pixel shr 16) and 0xFF) / 255f
-                val g = ((pixel shr 8) and 0xFF) / 255f
-                val b = (pixel and 0xFF) / 255f
+        val pixels = IntArray(HASH_SIZE * HASH_SIZE)
+        scaled.getPixels(pixels, 0, HASH_SIZE, 0, 0, HASH_SIZE, HASH_SIZE)
 
-                val maxC = maxOf(r, g, b)
-                val minC = minOf(r, g, b)
-                val diff = maxC - minC
+        var p = 0
+        while (p < pixels.size) {
+            val pixel = pixels[p]
+            val r = ((pixel shr 16) and 0xFF) / 255f
+            val g = ((pixel shr 8) and 0xFF) / 255f
+            val b = (pixel and 0xFF) / 255f
 
-                // Value histogram (always counted)
-                val vBin = (maxC * (VAL_BINS - 1)).toInt().coerceIn(0, VAL_BINS - 1)
-                vHist[vBin]++
+            val maxC = maxOf(r, g, b)
+            val minC = minOf(r, g, b)
+            val diff = maxC - minC
 
-                // Only count hue/sat for chromatic pixels
-                if (diff > 0.01f) {
-                    chromaPixels++
+            // Value histogram (always counted)
+            val vBin = (maxC * (VAL_BINS - 1)).toInt().coerceIn(0, VAL_BINS - 1)
+            vHist[vBin]++
 
-                    // Hue [0, 6) → normalized to [0, 1)
-                    val hue = when (maxC) {
-                        r -> ((g - b) / diff).let { if (it < 0) it + 6 else it }
-                        g -> (b - r) / diff + 2
-                        else -> (r - g) / diff + 4
-                    } / 6f
+            // Only count hue/sat for chromatic pixels
+            if (diff > 0.01f) {
+                chromaPixels++
 
-                    val sat = diff / maxC
+                // Hue [0, 6) → normalized to [0, 1)
+                val hue = when (maxC) {
+                    r -> ((g - b) / diff).let { if (it < 0) it + 6 else it }
+                    g -> (b - r) / diff + 2
+                    else -> (r - g) / diff + 4
+                } / 6f
 
-                    val hBin = (hue * HUE_BINS).toInt().coerceIn(0, HUE_BINS - 1)
-                    val sBin = (sat * (SAT_BINS - 1)).toInt().coerceIn(0, SAT_BINS - 1)
-                    hHist[hBin]++
-                    sHist[sBin]++
-                }
+                val sat = diff / maxC
+
+                val hBin = (hue * HUE_BINS).toInt().coerceIn(0, HUE_BINS - 1)
+                val sBin = (sat * (SAT_BINS - 1)).toInt().coerceIn(0, SAT_BINS - 1)
+                hHist[hBin]++
+                sHist[sBin]++
             }
+            p++
         }
 
         if (scaled !== bitmap) scaled.recycle()
@@ -202,7 +208,13 @@ object HandDetector {
         for (i in sHist.indices) sHist[i] = sHist[i] / chromaTotal
         for (i in vHist.indices) vHist[i] = vHist[i] / totalPixels
 
-        return hHist + sHist + vHist
+        // Avoid allocations from '+' operator; pack into one array.
+        val out = FloatArray(HIST_LEN)
+        var o = 0
+        for (i in hHist.indices) out[o++] = hHist[i]
+        for (i in sHist.indices) out[o++] = sHist[i]
+        for (i in vHist.indices) out[o++] = vHist[i]
+        return out
     }
 
     /**
@@ -340,6 +352,14 @@ object HandDetector {
         .readTimeout(10, TimeUnit.SECONDS)
         .build()
 
+    private data class CdnTemplate(
+        val name: String,
+        val normalColor: FloatArray,
+        val dimColor: FloatArray,
+        val normalHsv: FloatArray,
+        val dimHsv: FloatArray
+    )
+
     /**
      * Download card art PNGs from RoyaleAPI CDN and compute pHash templates.
      * Called automatically when a deck is loaded — no user interaction needed.
@@ -406,8 +426,13 @@ object HandDetector {
                     val dimHsv = toHsvHistogram(dimBitmap)
                     dimBitmap.recycle()
 
-                    // Return 5 arrays: name, normalHash, dimHash, normalHsv, dimHsv
-                    listOf(card.name, normalHash, dimHash, normalHsv, dimHsv)
+                    CdnTemplate(
+                        name = card.name,
+                        normalColor = normalHash,
+                        dimColor = dimHash,
+                        normalHsv = normalHsv,
+                        dimHsv = dimHsv
+                    )
                 } catch (e: Exception) {
                     Log.w(TAG, "PHASH: Failed to download CDN art for '${card.name}': ${e.message}")
                     null
@@ -418,13 +443,11 @@ object HandDetector {
         // Collect results
         var loaded = 0
         for (deferred in results) {
-            @Suppress("UNCHECKED_CAST")
-            val result = deferred.await() as? List<Any> ?: continue
-            val name = result[0] as String
-            templates[name] = result[1] as FloatArray
-            dimTemplates[name] = result[2] as FloatArray
-            hsvTemplates[name] = result[3] as FloatArray
-            dimHsvTemplates[name] = result[4] as FloatArray
+            val result = deferred.await() ?: continue
+            templates[result.name] = result.normalColor
+            dimTemplates[result.name] = result.dimColor
+            hsvTemplates[result.name] = result.normalHsv
+            dimHsvTemplates[result.name] = result.dimHsv
             loaded++
         }
 
