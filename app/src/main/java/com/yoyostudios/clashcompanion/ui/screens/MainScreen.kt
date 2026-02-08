@@ -82,7 +82,7 @@ fun MainScreen(activity: MainActivity) {
             CrCrown(size = 52.dp)
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "CLASH COMPANION",
+                text = "CLASH COMMANDER",
                 style = CrTypography.displayLarge,
                 color = CrColors.TextGold,
                 textAlign = TextAlign.Center
@@ -109,14 +109,19 @@ fun MainScreen(activity: MainActivity) {
                             .fillMaxWidth()
                             .clickable {
                                 // Open Clash Royale so user can share deck
-                                try {
-                                    val intent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
-                                        addCategory(android.content.Intent.CATEGORY_LAUNCHER)
-                                        setPackage("com.supercell.clashroyale")
-                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    }
-                                    activity.startActivity(intent)
-                                } catch (_: Exception) {}
+                                val launchIntent = activity.packageManager
+                                    .getLaunchIntentForPackage("com.supercell.clashroyale")
+                                if (launchIntent != null) {
+                                    launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    activity.startActivity(launchIntent)
+                                } else {
+                                    // CR not installed — open Play Store listing
+                                    val storeIntent = android.content.Intent(
+                                        android.content.Intent.ACTION_VIEW,
+                                        android.net.Uri.parse("https://play.google.com/store/apps/details?id=com.supercell.clashroyale")
+                                    )
+                                    activity.startActivity(storeIntent)
+                                }
                             }
                             .padding(horizontal = 16.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -209,7 +214,7 @@ fun MainScreen(activity: MainActivity) {
                 .padding(horizontal = 20.dp, vertical = 12.dp)
         ) {
             CrButtonGold(
-                text = "LAUNCH COMPANION",
+                text = "LAUNCH COMMANDER",
                 onClick = { activity.launchOverlay() },
                 enabled = allReady,
                 icon = painterResource(id = R.drawable.ic_sword_crossed)

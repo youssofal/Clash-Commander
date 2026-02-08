@@ -16,6 +16,11 @@
     <!-- Internet for Anthropic API (Opus), Gemini API (Flash), and Roboflow -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Package visibility: allow querying Clash Royale (required Android 11+) -->
+    <queries>
+        <package android:name="com.supercell.clashroyale" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
