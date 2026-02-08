@@ -74,11 +74,20 @@ class SpeechService : Service() {
             val startTime = System.currentTimeMillis()
             Log.i(TAG, "STT: Model loading started...")
 
-            // Initialize VAD
+            // Extract model files from APK assets to filesystem (one-time).
+            // sherpa-onnx cannot mix asset paths and filesystem paths in the same
+            // recognizer config — all paths must be filesystem when using deck
+            // hotwords (written by DeckManager to filesDir). So we extract once
+            // and always use filesystem paths with assetManager = null.
+            extractModelFiles(application)
+
+            val filesDir = application.filesDir.absolutePath
+
+            // Initialize VAD (filesystem path, no assetManager)
             Log.i(TAG, "STT: Initializing Silero VAD...")
             val vadConfig = VadModelConfig(
                 sileroVadModelConfig = SileroVadModelConfig(
-                    model = "silero_vad.onnx",
+                    model = "$filesDir/silero_vad.onnx",
                     minSilenceDuration = 0.25f,
                     minSpeechDuration = 0.25f,
                     threshold = 0.5f,
@@ -86,10 +95,7 @@ class SpeechService : Service() {
                 ),
                 sampleRate = SAMPLE_RATE,
             )
-            vad = Vad(
-                assetManager = application.assets,
-                config = vadConfig,
-            )
+            vad = Vad(config = vadConfig)
             Log.i(TAG, "STT: Silero VAD initialized")
 
             // Initialize Zipformer Transducer with hotword biasing
@@ -102,11 +108,11 @@ class SpeechService : Service() {
                 deckHotwords.absolutePath
             } else {
                 Log.i(TAG, "STT: Using default hotwords (no deck loaded yet)")
-                "hotwords.txt"
+                "$filesDir/hotwords.txt"
             }
 
             Log.i(TAG, "STT: Initializing Zipformer Transducer int8 with hotwords...")
-            val modelDir = "sherpa-onnx-zipformer-en-2023-04-01"
+            val modelDir = "$filesDir/sherpa-onnx-zipformer-en-2023-04-01"
             val recognizerConfig = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
                 modelConfig = OfflineModelConfig(
@@ -127,10 +133,7 @@ class SpeechService : Service() {
                 hotwordsFile = hotwordsPath,
                 hotwordsScore = 2.0f,
             )
-            offlineRecognizer = OfflineRecognizer(
-                assetManager = application.assets,
-                config = recognizerConfig,
-            )
+            offlineRecognizer = OfflineRecognizer(config = recognizerConfig)
 
             val elapsed = System.currentTimeMillis() - startTime
             Log.i(TAG, "STT: Model loaded in ${elapsed}ms")
@@ -145,6 +148,48 @@ class SpeechService : Service() {
                 onTranscript?.invoke("[ERROR: Model load failed: ${e.message}]", 0)
             }
         }
+    }
+
+    /**
+     * Extract sherpa-onnx model files from APK assets to filesDir (one-time).
+     * Skips extraction if the encoder file already exists on disk.
+     */
+    private fun extractModelFiles(context: Context) {
+        val modelSubdir = "sherpa-onnx-zipformer-en-2023-04-01"
+        val encoderFile = java.io.File(context.filesDir, "$modelSubdir/encoder-epoch-99-avg-1.int8.onnx")
+        if (encoderFile.exists()) {
+            Log.i(TAG, "STT: Model files already extracted, skipping")
+            return
+        }
+
+        Log.i(TAG, "STT: Extracting model files from assets (one-time)...")
+        val extractStart = System.currentTimeMillis()
+
+        // Create model subdirectory
+        java.io.File(context.filesDir, modelSubdir).mkdirs()
+
+        val assetFiles = listOf(
+            "silero_vad.onnx",
+            "hotwords.txt",
+            "$modelSubdir/encoder-epoch-99-avg-1.int8.onnx",
+            "$modelSubdir/decoder-epoch-99-avg-1.int8.onnx",
+            "$modelSubdir/joiner-epoch-99-avg-1.int8.onnx",
+            "$modelSubdir/tokens.txt",
+            "$modelSubdir/bpe.vocab",
+        )
+
+        for (assetPath in assetFiles) {
+            val outFile = java.io.File(context.filesDir, assetPath)
+            context.assets.open(assetPath).use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            Log.i(TAG, "STT: Extracted $assetPath (${outFile.length() / 1024}KB)")
+        }
+
+        val elapsed = System.currentTimeMillis() - extractStart
+        Log.i(TAG, "STT: Model extraction complete in ${elapsed}ms")
     }
 
     fun startListening() {
