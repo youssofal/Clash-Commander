@@ -1,3 +1,6 @@
+# Handoff docs (contain API keys)
+HANDOFF.md
+
 # Build outputs
 build/
 app/build/
