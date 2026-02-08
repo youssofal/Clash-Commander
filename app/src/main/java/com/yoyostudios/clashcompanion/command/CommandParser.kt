@@ -61,9 +61,16 @@ object CommandParser {
             return ParsedCommand(CommandTier.IGNORE, rawTranscript = transcript)
         }
 
-        // Step 5a: Conditional pattern — "if [trigger] [action]"
-        if (segment.startsWith("if ")) {
-            return parseConditional(segment.removePrefix("if ").trim(), deckCards, transcript)
+        // Step 5a: Conditional pattern — "if/whenever/when/always [trigger] [action]"
+        val conditionalBody = when {
+            segment.startsWith("if ") -> segment.removePrefix("if ").trim()
+            segment.startsWith("whenever ") -> segment.removePrefix("whenever ").trim()
+            segment.startsWith("when ") -> segment.removePrefix("when ").trim()
+            segment.startsWith("always ") -> segment.removePrefix("always ").trim()
+            else -> null
+        }
+        if (conditionalBody != null) {
+            return parseConditional(conditionalBody, deckCards, transcript)
         }
 
         // Step 5b: Queue pattern — "queue/next/then [card] [zone]"
@@ -511,8 +518,8 @@ object CommandParser {
         // e.g. "if hog drop cannon center"
         // For M3: parse what we can, stub execution
 
-        // Try to find "drop"/"play" as separator
-        val separators = listOf(" drop ", " play ", " use ", " then ")
+        // Try to find "drop"/"play" as separator (longest first to avoid partial matches)
+        val separators = listOf(" always play ", " always drop ", " drop ", " play ", " use ", " then ")
         for (sep in separators) {
             if (body.contains(sep)) {
                 val parts = body.split(sep, limit = 2)

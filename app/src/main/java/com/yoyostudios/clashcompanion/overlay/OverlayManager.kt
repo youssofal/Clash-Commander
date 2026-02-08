@@ -17,9 +17,11 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.yoyostudios.clashcompanion.BuildConfig
 import com.yoyostudios.clashcompanion.accessibility.ClashCompanionAccessibilityService
 import com.yoyostudios.clashcompanion.capture.ScreenCaptureService
 import com.yoyostudios.clashcompanion.command.CommandRouter
+import com.yoyostudios.clashcompanion.detection.ArenaDetector
 import com.yoyostudios.clashcompanion.detection.HandDetector
 import com.yoyostudios.clashcompanion.speech.SpeechService
 import com.yoyostudios.clashcompanion.util.Coordinates
@@ -28,12 +30,22 @@ class OverlayManager(private val context: Context) {
 
     companion object {
         private const val TAG = "ClashCompanion"
+
+        // Tier colors for status display
+        private const val COLOR_FAST = 0xFF4CAF50.toInt()      // Green
+        private const val COLOR_QUEUE = 0xFF2196F3.toInt()     // Blue
+        private const val COLOR_SMART = 0xFFAB47BC.toInt()     // Purple
+        private const val COLOR_TARGET = 0xFFFFEB3B.toInt()    // Yellow
+        private const val COLOR_RULE = 0xFFFF9800.toInt()      // Orange
+        private const val COLOR_AUTOPILOT = 0xFFF5A623.toInt() // Gold
+        private const val COLOR_ERROR = 0xFFEF5350.toInt()     // Red
     }
 
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var overlayView: View? = null
     private var statusText: TextView? = null
     private var handText: TextView? = null
+    private var autopilotText: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
     private val handler = Handler(Looper.getMainLooper())
 
@@ -43,7 +55,6 @@ class OverlayManager(private val context: Context) {
     private var isMinimized = false
 
     // Periodic queue check — ensures retries happen even when hand state is stable
-    // (e.g., all cards dimmed due to low elixir, no hand changes firing)
     private val queueCheckRunnable = object : Runnable {
         override fun run() {
             CommandRouter.checkQueue()
@@ -75,84 +86,57 @@ class OverlayManager(private val context: Context) {
 
         val layout = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(200, 30, 30, 30))
-            setPadding(24, 16, 24, 16)
+            setBackgroundColor(Color.argb(210, 20, 20, 20))
+            setPadding(20, 12, 20, 12)
         }
 
-        // Status text
+        // ── Autopilot indicator (hidden by default) ──
+        val autopilotLabel = TextView(context).apply {
+            text = "AI AUTOPILOT ACTIVE"
+            setTextColor(COLOR_AUTOPILOT)
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            visibility = View.GONE
+            setPadding(0, 0, 0, 4)
+        }
+        autopilotText = autopilotLabel
+        layout.addView(autopilotLabel)
+
+        // ── Status text (tier-colored command feedback) ──
         val status = TextView(context).apply {
             text = "Clash Companion Ready"
             setTextColor(Color.WHITE)
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
+            maxLines = 3
         }
         statusText = status
         layout.addView(status)
 
-        // Test tap card slot 1
-        val btnTapSlot = Button(context).apply {
-            text = "Tap Card Slot 1"
-            textSize = 12f
-            setOnClickListener {
-                val svc = ClashCompanionAccessibilityService.instance
-                if (svc == null) {
-                    updateStatus("ERROR: Accessibility not enabled")
-                    return@setOnClickListener
-                }
-                val (x, y) = Coordinates.CARD_SLOT_1
-                val ok = svc.safeTap(x, y)
-                updateStatus(if (ok) "Tapped slot 1 ($x, $y)" else "BLOCKED — release screen")
-            }
+        // ── Hand state display (green text showing detected cards) ──
+        val handDisplay = TextView(context).apply {
+            text = ""
+            setTextColor(Color.argb(255, 100, 255, 100))
+            textSize = 11f
+            maxLines = 4
         }
-        layout.addView(btnTapSlot)
+        handText = handDisplay
+        layout.addView(handDisplay)
 
-        // Test play card: slot 1 -> left bridge
-        val btnPlayCard = Button(context).apply {
-            text = "Play Slot 1 -> Left Bridge"
-            textSize = 12f
-            setOnClickListener {
-                val svc = ClashCompanionAccessibilityService.instance
-                if (svc == null) {
-                    updateStatus("ERROR: Accessibility not enabled")
-                    return@setOnClickListener
-                }
-                val (sx, sy) = Coordinates.CARD_SLOT_1
-                val (zx, zy) = Coordinates.LEFT_BRIDGE
-                // Enable passthrough so zone tap doesn't hit the overlay
-                setPassthrough(true)
-                svc.playCard(sx, sy, zx, zy)
-                updateStatus("Playing slot 1 -> left bridge")
-                // Restore touchability after gesture completes
-                handler.postDelayed({ setPassthrough(false) }, 500)
-            }
+        // ── Button row: Listen + Minimize + Close ──
+        val buttonRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 6, 0, 0)
         }
-        layout.addView(btnPlayCard)
-
-        // Test play card: slot 2 -> right bridge
-        val btnPlayCard2 = Button(context).apply {
-            text = "Play Slot 2 -> Right Bridge"
-            textSize = 12f
-            setOnClickListener {
-                val svc = ClashCompanionAccessibilityService.instance
-                if (svc == null) {
-                    updateStatus("ERROR: Accessibility not enabled")
-                    return@setOnClickListener
-                }
-                val (sx, sy) = Coordinates.CARD_SLOT_2
-                val (zx, zy) = Coordinates.RIGHT_BRIDGE
-                setPassthrough(true)
-                svc.playCard(sx, sy, zx, zy)
-                updateStatus("Playing slot 2 -> right bridge")
-                handler.postDelayed({ setPassthrough(false) }, 500)
-            }
-        }
-        layout.addView(btnPlayCard2)
 
         // Start/Stop Listening toggle
         var isListening = false
         val btnListen = Button(context).apply {
-            text = "Start Listening"
-            textSize = 12f
+            text = "Listen"
+            textSize = 11f
+            minWidth = 0; minimumWidth = 0
+            minHeight = 0; minimumHeight = 0
+            setPadding(16, 6, 16, 6)
             setOnClickListener {
                 val svc = SpeechService.instance
                 if (svc == null) {
@@ -164,63 +148,42 @@ class OverlayManager(private val context: Context) {
                         CommandRouter.handleTranscript(text, latencyMs)
                     }
                     svc.startListening()
-                    text = "Stop Listening"
+                    text = "Stop"
                     isListening = true
                     updateStatus("Listening...")
                 } else {
                     svc.stopListening()
-                    text = "Start Listening"
+                    text = "Listen"
                     isListening = false
                     updateStatus("Stopped listening")
                 }
             }
         }
-        layout.addView(btnListen)
-
-        // Hand state display (green text showing detected cards)
-        val handDisplay = TextView(context).apply {
-            text = ""
-            setTextColor(Color.argb(255, 100, 255, 100))
-            textSize = 11f
-        }
-        handText = handDisplay
-        layout.addView(handDisplay)
-
-        // Save screenshot test button
-        val btnScreenshot = Button(context).apply {
-            text = "Save Screenshot"
-            textSize = 12f
-            setOnClickListener {
-                val frame = ScreenCaptureService.getLatestFrame()
-                if (frame == null) {
-                    updateStatus("ERROR: No frame (start capture first)")
-                    return@setOnClickListener
-                }
-                val saved = saveScreenshot(frame)
-                if (saved) {
-                    updateStatus("Saved! ${frame.width}x${frame.height}")
-                } else {
-                    updateStatus("ERROR: Failed to save screenshot")
-                }
-            }
-        }
-        layout.addView(btnScreenshot)
+        buttonRow.addView(btnListen)
 
         // Minimize button
         val btnMinimize = Button(context).apply {
-            text = "Minimize"
-            textSize = 12f
+            text = "Min"
+            textSize = 11f
+            minWidth = 0; minimumWidth = 0
+            minHeight = 0; minimumHeight = 0
+            setPadding(16, 6, 16, 6)
             setOnClickListener { minimize() }
         }
-        layout.addView(btnMinimize)
+        buttonRow.addView(btnMinimize)
 
         // Close overlay button
         val btnClose = Button(context).apply {
-            text = "Close Overlay"
-            textSize = 12f
+            text = "Close"
+            textSize = 11f
+            minWidth = 0; minimumWidth = 0
+            minHeight = 0; minimumHeight = 0
+            setPadding(16, 6, 16, 6)
             setOnClickListener { hide() }
         }
-        layout.addView(btnClose)
+        buttonRow.addView(btnClose)
+
+        layout.addView(buttonRow)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -241,7 +204,7 @@ class OverlayManager(private val context: Context) {
         CommandRouter.overlay = this
         Log.i(TAG, "Overlay shown")
 
-        // Auto-start hand scanning with ResNet classifier
+        // Auto-start hand scanning with ML classifier
         if (!HandDetector.isScanning && ScreenCaptureService.instance != null) {
             HandDetector.startScanning(CommandRouter.deckCards, context) { hand ->
                 handler.post {
@@ -249,7 +212,15 @@ class OverlayManager(private val context: Context) {
                     CommandRouter.checkQueue()
                 }
             }
-            updateStatus("Scanning hand (ResNet classifier)")
+            updateStatus("Scanning hand (ML classifier)")
+        }
+
+        // Start arena detection if Roboflow API key is configured
+        if (BuildConfig.ROBOFLOW_API_KEY.isNotBlank() && !ArenaDetector.isPolling) {
+            ArenaDetector.startPolling { detections ->
+                handler.post { CommandRouter.checkRules(detections) }
+            }
+            Log.i(TAG, "ARENA: Started Roboflow polling")
         }
 
         // Start periodic queue check (every 2s) for elixir retry
@@ -259,25 +230,21 @@ class OverlayManager(private val context: Context) {
 
     /**
      * Minimize: hide the full overlay, show a small floating button.
-     * Hand scanning and listening KEEP RUNNING — only the UI collapses.
+     * Hand scanning, listening, and arena detection KEEP RUNNING.
      */
     private fun minimize() {
         if (isMinimized) return
 
-        // Hide the full overlay (but don't remove — keep references alive)
         overlayView?.visibility = View.GONE
 
-        // Create the small floating restore button
         val restoreBtn = Button(context).apply {
             text = "CC"
             textSize = 11f
             setBackgroundColor(Color.argb(180, 30, 30, 30))
-            setTextColor(Color.argb(255, 245, 166, 35)) // Gold
+            setTextColor(COLOR_AUTOPILOT)
             setPadding(16, 8, 16, 8)
-            minWidth = 0
-            minimumWidth = 0
-            minHeight = 0
-            minimumHeight = 0
+            minWidth = 0; minimumWidth = 0
+            minHeight = 0; minimumHeight = 0
             setOnClickListener { maximize() }
         }
 
@@ -301,20 +268,15 @@ class OverlayManager(private val context: Context) {
         Log.i(TAG, "Overlay minimized")
     }
 
-    /**
-     * Maximize: restore the full overlay, remove the floating button.
-     */
     private fun maximize() {
         if (!isMinimized) return
 
-        // Remove the small button
         minimizedView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
         minimizedView = null
         minimizedParams = null
 
-        // Show the full overlay
         overlayView?.visibility = View.VISIBLE
         isMinimized = false
         Log.i(TAG, "Overlay maximized")
@@ -323,7 +285,10 @@ class OverlayManager(private val context: Context) {
     fun hide() {
         handler.removeCallbacks(queueCheckRunnable)
         HandDetector.stopScanning()
+        ArenaDetector.stopPolling()
         CommandRouter.clearQueue()
+        CommandRouter.clearRules()
+        CommandRouter.stopAutopilot()
         // Remove minimized button if present
         minimizedView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
@@ -336,44 +301,48 @@ class OverlayManager(private val context: Context) {
             overlayView = null
             statusText = null
             handText = null
+            autopilotText = null
             layoutParams = null
             Log.i(TAG, "Overlay hidden")
         }
     }
 
     fun updateStatus(message: String) {
+        // Apply tier color based on message prefix
+        val color = when {
+            message.startsWith("FAST:") -> COLOR_FAST
+            message.startsWith("QUEUE") || message.startsWith("THEN:") -> COLOR_QUEUE
+            message.startsWith("SMART:") || message.startsWith("AUTO:") -> COLOR_SMART
+            message.startsWith("TARGET:") -> COLOR_TARGET
+            message.startsWith("RULE") -> COLOR_RULE
+            message.startsWith("AUTOPILOT") -> COLOR_AUTOPILOT
+            message.startsWith("ERROR") || message.startsWith("Not in hand") -> COLOR_ERROR
+            else -> Color.WHITE
+        }
+        statusText?.setTextColor(color)
         statusText?.text = message
         Log.i(TAG, "Status: $message")
+    }
+
+    /**
+     * Show/hide the autopilot active indicator.
+     */
+    fun setAutopilotActive(active: Boolean) {
+        autopilotText?.visibility = if (active) View.VISIBLE else View.GONE
     }
 
     fun updateHandDisplay(hand: Map<Int, String>) {
         val slots = (0..3).map { hand[it] ?: "?" }
         val next = hand[4] ?: "?"
         val queueInfo = CommandRouter.getQueueDisplay()
-        val text = "Hand: ${slots.joinToString(" | ")} | Next: $next"
-        handText?.text = if (queueInfo.isNotEmpty()) "$text\nQueue:\n$queueInfo" else text
-    }
-
-    private fun saveScreenshot(bitmap: Bitmap): Boolean {
-        return try {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "clash_test_${System.currentTimeMillis()}.png")
-                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ClashCompanion")
-            }
-            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri != null) {
-                context.contentResolver.openOutputStream(uri)?.use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                }
-                Log.i(TAG, "Screenshot saved: ${bitmap.width}x${bitmap.height}")
-                true
-            } else {
-                false
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to save screenshot: ${e.message}")
-            false
+        val rulesInfo = CommandRouter.getRulesDisplay()
+        val sb = StringBuilder("Hand: ${slots.joinToString(" | ")} | Next: $next")
+        if (queueInfo.isNotEmpty()) sb.append("\nQueue:\n$queueInfo")
+        if (rulesInfo.isNotEmpty()) sb.append("\nRules:\n$rulesInfo")
+        if (ArenaDetector.isPolling) {
+            val detCount = ArenaDetector.currentDetections.size
+            if (detCount > 0) sb.append("\nArena: $detCount detected")
         }
+        handText?.text = sb.toString()
     }
 }

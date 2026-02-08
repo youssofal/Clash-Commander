@@ -3,21 +3,28 @@ package com.yoyostudios.clashcompanion.command
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.google.gson.JsonParser
 import com.yoyostudios.clashcompanion.accessibility.ClashCompanionAccessibilityService
+import com.yoyostudios.clashcompanion.api.GeminiClient
 import com.yoyostudios.clashcompanion.command.CommandParser.CommandTier
+import com.yoyostudios.clashcompanion.deck.DeckManager
+import com.yoyostudios.clashcompanion.detection.ArenaDetector
 import com.yoyostudios.clashcompanion.detection.HandDetector
 import com.yoyostudios.clashcompanion.overlay.OverlayManager
+import com.yoyostudios.clashcompanion.strategy.OpusCoach
 import com.yoyostudios.clashcompanion.util.Coordinates
+import kotlinx.coroutines.*
 
 /**
- * Routes parsed commands to execution.
+ * Routes parsed commands to execution across five tiers:
  *
- * Executes:
- *  - FAST path: card slot tap + zone tap via AccessibilityService
+ *  - FAST path: card slot tap + zone tap via AccessibilityService (~170ms)
  *  - QUEUE path: buffered commands that auto-play when card appears in hand
+ *  - SMART path: Gemini Flash real-time tactical decisions using Opus playbook
+ *  - TARGETING path: spell placement on Roboflow-detected enemy troop
+ *  - CONDITIONAL path: voice rules triggered by Roboflow arena detection
  *
- * Stubs (display-only, implemented in future milestones):
- *  - TARGETING (M9), CONDITIONAL (M9), SMART (M8)
+ * Also supports AUTOPILOT mode: AI plays cards automatically every ~4 seconds.
  */
 object CommandRouter {
 
@@ -36,6 +43,32 @@ object CommandRouter {
     private var isBusy = false
 
     private val handler = Handler(Looper.getMainLooper())
+
+    // Coroutine scope for Smart Path and Autopilot async calls
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    // ── Autopilot ─────────────────────────────────────────────────────────
+
+    /** Whether autopilot mode is active (AI plays cards automatically) */
+    var isAutopilot = false
+        private set
+
+    private var autopilotJob: Job? = null
+
+    /** Autopilot decision interval in milliseconds */
+    private const val AUTOPILOT_INTERVAL_MS = 4000L
+
+    /** Commands that toggle autopilot ON */
+    private val AUTOPILOT_ON_COMMANDS = setOf(
+        "autopilot", "play for me", "auto play", "auto", "autoplay",
+        "take over", "ai play", "ai mode"
+    )
+
+    /** Commands that toggle autopilot OFF */
+    private val AUTOPILOT_OFF_COMMANDS = setOf(
+        "stop", "manual", "stop autopilot", "i got it", "stop auto",
+        "my turn", "cancel autopilot"
+    )
 
     // ── Queue Path (M7) ────────────────────────────────────────────────
 
@@ -60,6 +93,22 @@ object CommandRouter {
     /** Grace period before removing a "played" entry — card may just be dimmed (low elixir) */
     private const val QUEUE_PLAYED_GRACE_MS = 5000L
 
+    // ── Conditional Rules ──────────────────────────────────────────────
+
+    /** A voice rule that triggers when Roboflow detects an enemy card */
+    data class ConditionalRule(
+        val triggerCard: String,     // Enemy card to watch for (e.g., "Hog Rider")
+        val responseCard: String,   // Your card to play (e.g., "Skeleton Army")
+        val responseZone: String,   // Where to play it (e.g., "center")
+        val timestamp: Long = System.currentTimeMillis(),
+        var consecutiveFrames: Int = 0  // Debounce counter
+    )
+
+    /** Active conditional rules. Accessed only on main thread. */
+    private val activeRules = mutableListOf<ConditionalRule>()
+
+    // ── Main Entry Point ──────────────────────────────────────────────
+
     /**
      * Main entry point. Called by SpeechService.onTranscript via OverlayManager.
      * Parses the transcript and routes to the appropriate execution tier.
@@ -71,6 +120,18 @@ object CommandRouter {
      * @param sttLatencyMs time taken by STT inference in milliseconds
      */
     fun handleTranscript(transcript: String, sttLatencyMs: Long) {
+        val cleaned = CommandParser.cleanTranscript(transcript)
+
+        // ── Autopilot toggle (check before parsing) ───────────────────
+        if (cleaned in AUTOPILOT_ON_COMMANDS) {
+            startAutopilot()
+            return
+        }
+        if (cleaned in AUTOPILOT_OFF_COMMANDS) {
+            stopAutopilot()
+            return
+        }
+
         // Guard: don't fire while previous tap is animating
         if (isBusy) {
             Log.d(TAG, "CMD: Busy, skipping '$transcript'")
@@ -81,8 +142,7 @@ object CommandRouter {
         val parseStart = System.currentTimeMillis()
 
         // Split on "then"/"than" for chained commands:
-        // "knight left then musketeer right" → play knight, queue musketeer
-        val cleaned = CommandParser.cleanTranscript(transcript)
+        // "knight left then musketeer right" -> play knight, queue musketeer
         val normalized = cleaned
             .replace(" and then ", " then ")
             .replace(" than ", " then ")
@@ -136,35 +196,15 @@ object CommandRouter {
             }
 
             CommandTier.TARGETING -> {
-                val msg = if (cmd.card.isNotEmpty() && cmd.targetCard != null) {
-                    "TARGET: ${cmd.card} the ${cmd.targetCard} (M9)"
-                } else {
-                    "TARGET: couldn't parse (M9)"
-                }
-                overlay?.updateStatus(msg)
-                Log.i(TAG, "CMD: $msg")
+                executeTargetingPath(cmd, parseMs, sttLatencyMs)
             }
 
             CommandTier.CONDITIONAL -> {
-                val msg = if (cmd.triggerCard != null && cmd.card.isNotEmpty()) {
-                    "RULE: if ${cmd.triggerCard} -> ${cmd.card} ${cmd.zone ?: ""} (M9)"
-                } else {
-                    "RULE: couldn't parse (M9)"
-                }
-                overlay?.updateStatus(msg)
-                Log.i(TAG, "CMD: $msg")
+                executeConditionalPath(cmd)
             }
 
             CommandTier.SMART -> {
-                if (cmd.card.isNotEmpty()) {
-                    val msg = "Where? Say '${cmd.card} left/right/center'"
-                    overlay?.updateStatus(msg)
-                    Log.i(TAG, "CMD: $msg")
-                } else {
-                    val msg = "SMART: '${cmd.rawTranscript}' (M8)"
-                    overlay?.updateStatus(msg)
-                    Log.i(TAG, "CMD: $msg")
-                }
+                executeSmartPath(cmd, parseMs, sttLatencyMs, rawTranscript)
             }
         }
     }
@@ -190,29 +230,529 @@ object CommandRouter {
         Log.i(TAG, "CMD: $msg (${commandQueue.size} in queue)")
     }
 
-    // ── Queue Path Execution ─────────────────────────────────────────────
+    // ── Smart Path Execution (M8) ─────────────────────────────────────
+
+    /**
+     * Execute the Smart Path: send context to Gemini Flash for tactical AI decision.
+     *
+     * Assembles: deck + Opus playbook + current hand + arena state + user command.
+     * Gemini returns: {"action":"play","card":"...","zone":"...","reasoning":"..."}.
+     * Validates card in hand, executes via Fast Path, shows reasoning on overlay.
+     */
+    private fun executeSmartPath(
+        cmd: CommandParser.ParsedCommand,
+        parseMs: Long,
+        sttLatencyMs: Long,
+        rawTranscript: String
+    ) {
+        // If parser found a card but no zone (5+ elixir), ask for zone instead of LLM
+        if (cmd.card.isNotEmpty() && cmd.zone == null) {
+            val msg = "Where? Say '${cmd.card} left/right/center'"
+            overlay?.updateStatus(msg)
+            Log.i(TAG, "CMD: $msg")
+            return
+        }
+
+        isBusy = true
+        val startMs = System.currentTimeMillis()
+        overlay?.updateStatus("SMART: Thinking...")
+        Log.i(TAG, "CMD: SMART path — calling Gemini Flash for '$rawTranscript'")
+
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    val systemPrompt = buildSmartPrompt()
+                    val userMessage = rawTranscript
+                    GeminiClient.chat(
+                        systemInstruction = systemPrompt,
+                        userMessage = userMessage,
+                        maxTokens = 256,
+                        jsonMode = true
+                    )
+                }
+
+                val elapsed = System.currentTimeMillis() - startMs
+                Log.i(TAG, "CMD: SMART response in ${elapsed}ms: ${result.take(200)}")
+
+                // Parse JSON response
+                val cleanJson = GeminiClient.cleanJsonResponse(result)
+                val json = JsonParser.parseString(cleanJson).asJsonObject
+
+                val action = json.get("action")?.asString ?: "wait"
+                val reasoning = json.get("reasoning")?.asString ?: ""
+
+                if (action == "wait") {
+                    val msg = "SMART: Wait | $reasoning | ${elapsed}ms"
+                    overlay?.updateStatus(msg)
+                    Log.i(TAG, "CMD: $msg")
+                    isBusy = false
+                    return@launch
+                }
+
+                // action == "play"
+                val card = json.get("card")?.asString ?: ""
+                val zone = json.get("zone")?.asString ?: ""
+
+                if (card.isBlank() || zone.isBlank()) {
+                    overlay?.updateStatus("SMART: Bad response ($reasoning)")
+                    Log.w(TAG, "CMD: SMART returned empty card/zone: $cleanJson")
+                    isBusy = false
+                    return@launch
+                }
+
+                // Resolve card name (Gemini may return slightly different casing)
+                val resolvedCard = resolveCardName(card)
+                if (resolvedCard == null) {
+                    overlay?.updateStatus("SMART: Unknown card '$card'")
+                    Log.w(TAG, "CMD: SMART returned unknown card: $card")
+                    isBusy = false
+                    return@launch
+                }
+
+                // Resolve zone (Gemini returns zone keys like "center", "left_bridge")
+                val resolvedZone = resolveZoneName(zone)
+                if (resolvedZone == null) {
+                    overlay?.updateStatus("SMART: Unknown zone '$zone'")
+                    Log.w(TAG, "CMD: SMART returned unknown zone: $zone")
+                    isBusy = false
+                    return@launch
+                }
+
+                // Check card is in hand
+                if (!HandDetector.cardToSlot.containsKey(resolvedCard)) {
+                    // Auto-queue if not in hand
+                    commandQueue.add(QueuedCommand(resolvedCard, resolvedZone))
+                    val msg = "SMART: $resolvedCard not in hand, queued | $reasoning | ${elapsed}ms"
+                    overlay?.updateStatus(msg)
+                    Log.i(TAG, "CMD: $msg")
+                    isBusy = false
+                    return@launch
+                }
+
+                // Execute!
+                val msg = "SMART: $resolvedCard -> $resolvedZone | $reasoning | ${elapsed}ms"
+                overlay?.updateStatus(msg)
+                Log.i(TAG, "CMD: $msg")
+
+                // isBusy will be released by executeFastPath's handler.postDelayed
+                executeFastPath(
+                    CommandParser.ParsedCommand(
+                        tier = CommandTier.FAST,
+                        card = resolvedCard,
+                        zone = resolvedZone,
+                        confidence = 1.0f,
+                        rawTranscript = "SMART: $reasoning"
+                    ),
+                    parseMs = elapsed,
+                    sttLatencyMs = sttLatencyMs
+                )
+            } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - startMs
+                val msg = "SMART: Error (${elapsed}ms) ${e.message?.take(40)}"
+                overlay?.updateStatus(msg)
+                Log.e(TAG, "CMD: $msg", e)
+                isBusy = false
+            }
+        }
+    }
+
+    /**
+     * Build the Gemini system prompt with deck, playbook, hand state, and arena.
+     */
+    private fun buildSmartPrompt(): String {
+        val deckJson = DeckManager.getDeckJson()
+
+        val playbook = OpusCoach.cachedPlaybook
+        val playbookSection = if (!playbook.isNullOrBlank()) {
+            "STRATEGIC PLAYBOOK (from deep analysis):\n$playbook"
+        } else {
+            "STRATEGIC PLAYBOOK: Not available. Use general Clash Royale knowledge."
+        }
+
+        val hand = HandDetector.currentHand
+        val handCards = (0..3).mapNotNull { hand[it] }.joinToString(", ")
+        val handSection = if (handCards.isNotBlank()) {
+            "CURRENT HAND (cards available to play RIGHT NOW): $handCards"
+        } else {
+            "CURRENT HAND: Unknown (hand detection not ready)"
+        }
+
+        // Arena state from Roboflow (null-safe — may not be active)
+        val arenaSection = buildArenaSection()
+
+        return """You are a real-time Clash Royale tactical AI. Speed is critical — be decisive.
+
+DECK: $deckJson
+$playbookSection
+$handSection
+$arenaSection
+
+VALID ZONES: left_bridge, right_bridge, center, behind_left, behind_right, back_center, front_left, front_right
+
+Rules:
+- ONLY suggest cards in CURRENT HAND
+- Use playbook defense_table for defend commands
+- Use card_placement_defaults when no specific zone implied
+- For "follow up" or "suggest": pick best offensive play for current hand
+- For ambiguous commands: safest positive-elixir-trade play
+- Buildings go in "center" or "behind_left"/"behind_right"
+
+Respond ONLY with JSON: {"action":"play","card":"<exact card name>","zone":"<zone_key>","reasoning":"<15 words max>"}
+Or if waiting is better: {"action":"wait","reasoning":"<15 words max>"}"""
+    }
+
+    /**
+     * Build arena state section from ArenaDetector detections.
+     * Returns empty string if no detections available.
+     */
+    private fun buildArenaSection(): String {
+        val detections = ArenaDetector.currentDetections
+        if (detections.isEmpty()) return ""
+
+        val items = detections.joinToString(", ") { d ->
+            "${d.className} at (${d.centerX}, ${d.centerY}) conf=${String.format("%.0f", d.confidence * 100)}%"
+        }
+        return "ARENA STATE (enemy troops detected): $items"
+    }
+
+    /**
+     * Resolve a card name from Gemini response to exact deck card name.
+     * Handles case mismatches and minor variations.
+     */
+    private fun resolveCardName(geminiCard: String): String? {
+        // Exact match
+        deckCards.find { it.equals(geminiCard, ignoreCase = true) }?.let { return it }
+
+        // Fuzzy match against deck
+        val match = CommandParser.matchCard(geminiCard.lowercase(), deckCards)
+        return if (match != null && match.second > 0.6f) match.first else null
+    }
+
+    /**
+     * Resolve a zone name from Gemini response to a valid ZONE_MAP key.
+     */
+    private fun resolveZoneName(geminiZone: String): String? {
+        val zone = geminiZone.lowercase().trim()
+        // Direct match
+        if (Coordinates.ZONE_MAP.containsKey(zone)) return zone
+        // Try with underscores replaced by spaces and vice versa
+        val withSpaces = zone.replace("_", " ")
+        if (Coordinates.ZONE_MAP.containsKey(withSpaces)) return withSpaces
+        val withUnderscores = zone.replace(" ", "_")
+        if (Coordinates.ZONE_MAP.containsKey(withUnderscores)) return withUnderscores
+        return null
+    }
+
+    // ── Autopilot ─────────────────────────────────────────────────────
+
+    /**
+     * Start autopilot mode: AI plays cards automatically every ~4 seconds.
+     * Voice commands still work during autopilot (Fast Path overrides).
+     */
+    fun startAutopilot() {
+        if (isAutopilot) {
+            overlay?.updateStatus("AUTOPILOT already active")
+            return
+        }
+        isAutopilot = true
+        overlay?.updateStatus("AUTOPILOT: AI is playing!")
+        overlay?.setAutopilotActive(true)
+        Log.i(TAG, "CMD: Autopilot STARTED")
+
+        autopilotJob = scope.launch {
+            while (isActive) {
+                delay(AUTOPILOT_INTERVAL_MS)
+
+                // Skip if busy (another command executing) or hand not ready
+                if (isBusy) continue
+                val hand = HandDetector.currentHand
+                if (hand.filterKeys { it < 4 }.isEmpty()) continue
+
+                // Call Gemini for decision
+                try {
+                    isBusy = true
+                    val startMs = System.currentTimeMillis()
+
+                    val result = withContext(Dispatchers.IO) {
+                        val systemPrompt = buildSmartPrompt()
+                        GeminiClient.chat(
+                            systemInstruction = systemPrompt,
+                            userMessage = "AUTOPILOT: Decide what to play next or wait. Consider elixir management, card cycle, and tempo. Be aggressive when at 8+ elixir.",
+                            maxTokens = 256,
+                            jsonMode = true
+                        )
+                    }
+
+                    val elapsed = System.currentTimeMillis() - startMs
+                    val cleanJson = GeminiClient.cleanJsonResponse(result)
+                    val json = JsonParser.parseString(cleanJson).asJsonObject
+
+                    val action = json.get("action")?.asString ?: "wait"
+                    val reasoning = json.get("reasoning")?.asString ?: ""
+
+                    if (action == "wait") {
+                        withContext(Dispatchers.Main) {
+                            overlay?.updateStatus("AUTO: Wait | $reasoning")
+                        }
+                        isBusy = false
+                        continue
+                    }
+
+                    val card = json.get("card")?.asString ?: ""
+                    val zone = json.get("zone")?.asString ?: ""
+                    val resolvedCard = resolveCardName(card)
+                    val resolvedZone = resolveZoneName(zone)
+
+                    if (resolvedCard == null || resolvedZone == null) {
+                        Log.w(TAG, "CMD: AUTOPILOT bad response: card=$card zone=$zone")
+                        isBusy = false
+                        continue
+                    }
+
+                    if (!HandDetector.cardToSlot.containsKey(resolvedCard)) {
+                        withContext(Dispatchers.Main) {
+                            overlay?.updateStatus("AUTO: $resolvedCard not in hand | $reasoning")
+                        }
+                        isBusy = false
+                        continue
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        overlay?.updateStatus("AUTO: $resolvedCard -> $resolvedZone | $reasoning | ${elapsed}ms")
+                    }
+
+                    // Execute on main thread — executeFastPath releases isBusy via handler
+                    withContext(Dispatchers.Main) {
+                        executeFastPath(
+                            CommandParser.ParsedCommand(
+                                tier = CommandTier.FAST,
+                                card = resolvedCard,
+                                zone = resolvedZone,
+                                confidence = 1.0f,
+                                rawTranscript = "AUTOPILOT: $reasoning"
+                            ),
+                            parseMs = elapsed,
+                            sttLatencyMs = 0
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "CMD: AUTOPILOT error: ${e.message}")
+                    isBusy = false
+                }
+            }
+        }
+    }
+
+    /**
+     * Stop autopilot mode.
+     */
+    fun stopAutopilot() {
+        if (!isAutopilot) return
+        autopilotJob?.cancel()
+        autopilotJob = null
+        isAutopilot = false
+        isBusy = false
+        overlay?.setAutopilotActive(false)
+        overlay?.updateStatus("AUTOPILOT stopped — you're in control")
+        Log.i(TAG, "CMD: Autopilot STOPPED")
+    }
+
+    // ── Targeting Path Execution ──────────────────────────────────────
+
+    /**
+     * Execute the Targeting Path: place a spell on a Roboflow-detected enemy troop.
+     * e.g. "fireball the hog rider" -> find hog rider on arena -> place fireball there.
+     */
+    private fun executeTargetingPath(
+        cmd: CommandParser.ParsedCommand,
+        parseMs: Long,
+        sttLatencyMs: Long
+    ) {
+        if (cmd.card.isEmpty() || cmd.targetCard == null) {
+            overlay?.updateStatus("TARGET: couldn't parse")
+            return
+        }
+
+        // Look up target in ArenaDetector cache
+        val detections = ArenaDetector.currentDetections
+        val targetName = cmd.targetCard.lowercase()
+
+        // Fuzzy match detection class name against target card name
+        val match = detections.firstOrNull { d ->
+            val cls = d.className.lowercase().replace("-", " ").replace("_", " ")
+            cls.contains(targetName) || targetName.contains(cls) ||
+                    CommandParser.levenshteinSimilarity(cls, targetName) > 0.6f
+        }
+
+        if (match == null) {
+            val msg = "TARGET: ${cmd.targetCard} not detected on arena"
+            overlay?.updateStatus(msg)
+            Log.i(TAG, "CMD: $msg (${detections.size} detections available)")
+            return
+        }
+
+        // Check card is in hand
+        val slotIndex = HandDetector.cardToSlot[cmd.card]
+        if (slotIndex == null) {
+            overlay?.updateStatus("TARGET: ${cmd.card} not in hand")
+            return
+        }
+        if (slotIndex < 0 || slotIndex >= Coordinates.CARD_SLOTS.size) {
+            overlay?.updateStatus("TARGET: Invalid slot $slotIndex")
+            return
+        }
+
+        val svc = ClashCompanionAccessibilityService.instance
+        if (svc == null) {
+            overlay?.updateStatus("ERROR: Accessibility not connected")
+            return
+        }
+
+        isBusy = true
+        val (slotX, slotY) = Coordinates.CARD_SLOTS[slotIndex]
+
+        // Use detection center as target coordinates
+        val targetX = match.centerX.toFloat()
+        val targetY = match.centerY.toFloat()
+
+        val msg = "TARGET: ${cmd.card} -> ${cmd.targetCard} at (${match.centerX},${match.centerY})"
+        overlay?.updateStatus(msg)
+        Log.i(TAG, "CMD: $msg conf=${String.format("%.0f", match.confidence * 100)}%")
+
+        overlay?.setPassthrough(true)
+        svc.playCard(slotX, slotY, targetX, targetY)
+
+        handler.postDelayed({
+            overlay?.setPassthrough(false)
+            isBusy = false
+        }, 500)
+    }
+
+    // ── Conditional Rules Execution ───────────────────────────────────
+
+    /**
+     * Execute the Conditional Path: store a rule that triggers when Roboflow
+     * detects the specified enemy card.
+     * e.g. "whenever hog rider play skeleton army center"
+     */
+    private fun executeConditionalPath(cmd: CommandParser.ParsedCommand) {
+        if (cmd.triggerCard == null || cmd.card.isEmpty()) {
+            overlay?.updateStatus("RULE: couldn't parse rule")
+            Log.w(TAG, "CMD: Conditional parse incomplete: trigger=${cmd.triggerCard} card=${cmd.card}")
+            return
+        }
+
+        val zone = cmd.zone ?: CommandParser.getDefaultZone(cmd.card) ?: "center"
+
+        val rule = ConditionalRule(
+            triggerCard = cmd.triggerCard,
+            responseCard = cmd.card,
+            responseZone = zone
+        )
+        activeRules.add(rule)
+
+        val msg = "RULE SET: if ${cmd.triggerCard} -> ${cmd.card} $zone"
+        overlay?.updateStatus(msg)
+        Log.i(TAG, "CMD: $msg (${activeRules.size} active rules)")
+    }
+
+    /**
+     * Check active conditional rules against Roboflow arena detections.
+     * Called from OverlayManager when ArenaDetector reports new detections.
+     *
+     * Debounce: requires 2 consecutive detections before triggering.
+     * Fire-once: removes rule after trigger to prevent spam.
+     */
+    fun checkRules(detections: List<ArenaDetector.Detection>) {
+        if (isBusy || activeRules.isEmpty()) return
+
+        // Prune expired rules (>5 minutes old)
+        val now = System.currentTimeMillis()
+        activeRules.removeAll { now - it.timestamp > 300_000L }
+
+        val triggeredRules = mutableListOf<ConditionalRule>()
+
+        for (rule in activeRules) {
+            val triggerName = rule.triggerCard.lowercase()
+
+            // Check if any detection matches the trigger card
+            val detected = detections.any { d ->
+                val cls = d.className.lowercase().replace("-", " ").replace("_", " ")
+                cls.contains(triggerName) || triggerName.contains(cls) ||
+                        CommandParser.levenshteinSimilarity(cls, triggerName) > 0.6f
+            }
+
+            if (detected) {
+                rule.consecutiveFrames++
+                if (rule.consecutiveFrames >= 2) {
+                    // Debounce passed — check if response card is in hand
+                    if (HandDetector.cardToSlot.containsKey(rule.responseCard)) {
+                        triggeredRules.add(rule)
+                    } else {
+                        overlay?.updateStatus("RULE: ${rule.triggerCard} seen but ${rule.responseCard} not in hand")
+                    }
+                }
+            } else {
+                rule.consecutiveFrames = 0
+            }
+        }
+
+        // Execute first triggered rule (one at a time)
+        val rule = triggeredRules.firstOrNull() ?: return
+        activeRules.remove(rule) // Fire-once
+
+        val msg = "RULE FIRED: ${rule.triggerCard} detected -> ${rule.responseCard} ${rule.responseZone}!"
+        overlay?.updateStatus(msg)
+        Log.i(TAG, "CMD: $msg")
+
+        executeFastPath(
+            CommandParser.ParsedCommand(
+                tier = CommandTier.FAST,
+                card = rule.responseCard,
+                zone = rule.responseZone,
+                confidence = 1.0f,
+                rawTranscript = "RULE: if ${rule.triggerCard} -> ${rule.responseCard}"
+            ),
+            parseMs = 0,
+            sttLatencyMs = 0
+        )
+    }
+
+    /**
+     * Get display string of active rules for the overlay.
+     */
+    fun getRulesDisplay(): String {
+        if (activeRules.isEmpty()) return ""
+        return activeRules.joinToString("\n") { r ->
+            "  if ${r.triggerCard} -> ${r.responseCard} ${r.responseZone}"
+        }
+    }
+
+    /**
+     * Clear all active rules.
+     */
+    fun clearRules() {
+        val count = activeRules.size
+        activeRules.clear()
+        if (count > 0) Log.i(TAG, "CMD: Cleared $count rules")
+    }
+
+    // ── Queue Path Execution ─────────────────────────────────────────
 
     /**
      * Handle a QUEUE-tier command: "queue balloon bridge" / "next hog left" / "then hog left"
-     *
-     * Always adds to the command queue. If the card is already in hand,
-     * triggers checkQueue() immediately for a fast play attempt. If elixir
-     * is too low and the tap fails, checkQueue will retry every 1.5s until
-     * the card leaves hand (= successfully played).
      */
     private fun executeQueuePath(
         cmd: CommandParser.ParsedCommand,
         parseMs: Long,
         sttLatencyMs: Long
     ) {
-        // Validate: parser must have matched a card
         if (cmd.card.isEmpty()) {
             overlay?.updateStatus("Queue: couldn't parse card")
             Log.w(TAG, "CMD: Queue parse failed for '${cmd.rawTranscript}'")
             return
         }
 
-        // Validate: zone must be present (5+ elixir with no zone returns null)
         if (cmd.zone == null) {
             val msg = "Where? Say '${cmd.card} left/right/center'"
             overlay?.updateStatus(msg)
@@ -220,11 +760,9 @@ object CommandRouter {
             return
         }
 
-        // Always add to queue — checkQueue handles execution + elixir retry
         commandQueue.add(QueuedCommand(cmd.card, cmd.zone))
         Log.i(TAG, "CMD: QUEUED: ${cmd.card} -> ${cmd.zone} (${commandQueue.size} in queue)")
 
-        // If card is already in hand, trigger immediate play attempt
         if (!isBusy && HandDetector.cardToSlot.containsKey(cmd.card)) {
             checkQueue()
         } else {
@@ -235,15 +773,6 @@ object CommandRouter {
     /**
      * Check if any queued card has appeared in the player's hand.
      * Called from OverlayManager's onHandChanged callback on the main thread.
-     *
-     * Retry-with-cooldown logic for elixir handling:
-     * - When a card is in hand, attempt to play it (tap card slot + zone)
-     * - Don't remove entry yet — if elixir was too low, the tap does nothing
-     * - Wait 1.5s cooldown before retrying (elixir regeneration time)
-     * - Remove entry only when card LEAVES hand (= successfully played)
-     *
-     * Executes at most one queued command per call (isBusy gates 500ms gap).
-     * FIFO iteration order — first eligible queued card wins.
      */
     fun checkQueue() {
         if (isBusy || commandQueue.isEmpty()) return
@@ -256,10 +785,7 @@ object CommandRouter {
 
         val handSlots = HandDetector.cardToSlot
 
-        // Remove entries where card has been absent for >5s after attempt.
-        // This distinguishes "card truly played" (gone for 5+ seconds) from
-        // "card temporarily dimmed" (gone for ~1-2s due to low elixir).
-        // Dimmed cards come back when elixir regenerates; played cards don't.
+        // Remove entries where card has been absent for >5s after attempt
         commandQueue.removeAll { q ->
             q.lastAttemptMs > 0
                     && !handSlots.containsKey(q.card)
@@ -267,15 +793,10 @@ object CommandRouter {
         }
         if (commandQueue.isEmpty()) return
 
-        // Find first queued card that's in hand and not cooling down
         for (queued in commandQueue) {
-            // Card not in hand yet — skip, keep waiting
             if (!handSlots.containsKey(queued.card)) continue
-
-            // Card is in hand but cooling down from a failed attempt (elixir too low)
             if (queued.lastAttemptMs > 0 && now - queued.lastAttemptMs < QUEUE_RETRY_COOLDOWN_MS) continue
 
-            // Card is in hand and ready to play!
             val isRetry = queued.lastAttemptMs > 0
             queued.lastAttemptMs = now
             val waitMs = now - queued.timestamp
@@ -287,7 +808,6 @@ object CommandRouter {
                     if (isRetry) " (retry)" else ""
             overlay?.updateStatus(msg)
 
-            // Execute via Fast Path with full safety checks
             executeFastPath(
                 CommandParser.ParsedCommand(
                     tier = CommandTier.FAST,
@@ -299,14 +819,10 @@ object CommandRouter {
                 parseMs = 0,
                 sttLatencyMs = waitMs
             )
-            return // One at a time — isBusy blocks until 500ms release
+            return
         }
     }
 
-    /**
-     * Clear all pending queue entries.
-     * Called from OverlayManager.hide() to prevent phantom plays.
-     */
     fun clearQueue() {
         val count = commandQueue.size
         commandQueue.clear()
@@ -316,10 +832,6 @@ object CommandRouter {
         }
     }
 
-    /**
-     * Get a display string of active queue entries for the overlay.
-     * Returns empty string if queue is empty.
-     */
     fun getQueueDisplay(): String {
         if (commandQueue.isEmpty()) return ""
         return commandQueue.joinToString("\n") { q ->
@@ -328,16 +840,20 @@ object CommandRouter {
         }
     }
 
-    // ── Fast Path Execution ───────────────────────────────────────────────
+    // ── Fast Path Execution ───────────────────────────────────────────
 
     /**
      * Execute the Fast Path: tap card slot, then tap zone.
-     * Includes confidence gating and hand verification.
+     * Also used by Smart Path, Queue Path, Targeting, and Rules as final executor.
+     *
+     * Accepts optional raw pixel coordinates for targeting (overrides zone lookup).
      */
     private fun executeFastPath(
         cmd: CommandParser.ParsedCommand,
         parseMs: Long,
-        sttLatencyMs: Long
+        sttLatencyMs: Long,
+        rawTargetX: Float? = null,
+        rawTargetY: Float? = null
     ) {
         val card = cmd.card
         val zone = cmd.zone
@@ -352,10 +868,9 @@ object CommandRouter {
             return
         }
 
-        // Check card is in hand via ResNet classifier
+        // Check card is in hand via classifier
         val slotIndex = HandDetector.cardToSlot[card]
         if (slotIndex == null) {
-            // Only show hand slots 0-3, not next-card slot 4
             val handCards = HandDetector.currentHand
                 .filterKeys { it < 4 }
                 .entries.sortedBy { it.key }
@@ -366,7 +881,6 @@ object CommandRouter {
             return
         }
 
-        // Get coordinates
         if (slotIndex < 0 || slotIndex >= Coordinates.CARD_SLOTS.size) {
             val msg = "ERROR: Invalid slot index $slotIndex for $card"
             overlay?.updateStatus(msg)
@@ -376,23 +890,29 @@ object CommandRouter {
 
         val (slotX, slotY) = Coordinates.CARD_SLOTS[slotIndex]
 
-        // Zone coordinates
-        if (zone == null) {
-            val msg = "ERROR: No zone for $card"
-            overlay?.updateStatus(msg)
-            Log.e(TAG, "CMD: $msg")
-            return
+        // Zone coordinates — use raw target if provided, otherwise look up zone map
+        val zoneX: Float
+        val zoneY: Float
+        if (rawTargetX != null && rawTargetY != null) {
+            zoneX = rawTargetX
+            zoneY = rawTargetY
+        } else {
+            if (zone == null) {
+                val msg = "ERROR: No zone for $card"
+                overlay?.updateStatus(msg)
+                Log.e(TAG, "CMD: $msg")
+                return
+            }
+            val zoneCoords = Coordinates.ZONE_MAP[zone]
+            if (zoneCoords == null) {
+                val msg = "ERROR: Unknown zone '$zone'"
+                overlay?.updateStatus(msg)
+                Log.e(TAG, "CMD: $msg")
+                return
+            }
+            zoneX = zoneCoords.first
+            zoneY = zoneCoords.second
         }
-
-        val zoneCoords = Coordinates.ZONE_MAP[zone]
-        if (zoneCoords == null) {
-            val msg = "ERROR: Unknown zone '$zone'"
-            overlay?.updateStatus(msg)
-            Log.e(TAG, "CMD: $msg")
-            return
-        }
-
-        val (zoneX, zoneY) = zoneCoords
 
         // Execute!
         val svc = ClashCompanionAccessibilityService.instance
@@ -406,11 +926,17 @@ object CommandRouter {
         isBusy = true
 
         val totalMs = parseMs + sttLatencyMs
-        val msg = "FAST: $card -> $zone (${parseMs}ms + STT ${sttLatencyMs}ms = ${totalMs}ms)"
-        overlay?.updateStatus(msg)
-        Log.i(TAG, "CMD: $msg — tapping slot $slotIndex ($slotX, $slotY) -> zone ($zoneX, $zoneY)")
+        val displayZone = zone ?: "(${zoneX.toInt()},${zoneY.toInt()})"
+        if (!cmd.rawTranscript.startsWith("SMART:") &&
+            !cmd.rawTranscript.startsWith("AUTOPILOT:") &&
+            !cmd.rawTranscript.startsWith("QUEUE") &&
+            !cmd.rawTranscript.startsWith("RULE:")) {
+            val msg = "FAST: $card -> $displayZone | ${totalMs}ms"
+            overlay?.updateStatus(msg)
+        }
+        Log.i(TAG, "CMD: PLAY $card slot=$slotIndex ($slotX,$slotY) -> ($zoneX,$zoneY) ${totalMs}ms")
 
-        // Make overlay transparent to touches so dispatchGesture doesn't hit overlay buttons
+        // Make overlay transparent to touches so dispatchGesture doesn't hit overlay
         overlay?.setPassthrough(true)
         svc.playCard(slotX, slotY, zoneX, zoneY)
 
@@ -419,5 +945,13 @@ object CommandRouter {
             overlay?.setPassthrough(false)
             isBusy = false
         }, 500)
+    }
+
+    /**
+     * Clean up resources. Call when app is being destroyed.
+     */
+    fun destroy() {
+        stopAutopilot()
+        scope.cancel()
     }
 }

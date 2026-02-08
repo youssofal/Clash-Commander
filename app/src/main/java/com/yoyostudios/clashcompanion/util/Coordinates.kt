@@ -86,6 +86,12 @@ object Coordinates {
     val CARD_SLOT_ROIS: List<CardSlotROI> get() = REF_CARD_ROIS
     val NEXT_CARD_ROI: CardSlotROI get() = REF_NEXT_ROI
 
+    // ── Arena Crop Region (for Roboflow detection) ────────────────
+    // Excludes top UI bar and bottom card hand area.
+    // Values are raw 1080x2340 reference pixels.
+    const val ARENA_CROP_TOP = 200
+    const val ARENA_CROP_BOTTOM = 1900
+
     // ── Card Slot Centers (bottom of screen, 4 visible cards) ──
     val CARD_SLOT_1 get() = pos(350f, 2130f)
     val CARD_SLOT_2 get() = pos(520f, 2130f)
