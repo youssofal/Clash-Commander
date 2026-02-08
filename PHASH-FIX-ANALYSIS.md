@@ -4,7 +4,7 @@
 
 **Root cause found:** 2 out of 4 hand cards are misidentified because:
 1. **CDN art is composited onto WHITE background** — the transparent corners become white, which makes cards with sky-blue backgrounds (especially Arrows) match everything
-2. **ROI crop dimensions are wrong** — code crops 177px wide but actual card art is ~188px wide; the code also starts 20px too high (includes dark frame above art)
+2. **ROI crop region didn’t match CDN art** — the old ROI included card frame + elixir badge; switching to an art/portrait-only ROI (and widening slightly) puts in-game crops in the same “feature space” as CDN portraits
 3. **16x16 hash is too low resolution** — insufficient spatial detail to distinguish similar-looking cards
 
 ## Tested on Real Screenshot
@@ -45,7 +45,7 @@ Samsung A35, 1080x2340, in-game match with:
 ### Fix 4: Corrected ROI coordinates
 Pixel-measured from actual Samsung A35 screenshot:
 
-| Slot | Code ROI | Corrected ROI | Change |
+| Slot | Code ROI | New ROI (art-only) | Change |
 |------|----------|--------------|--------|
 | 0 | (248, 2025, 177, 215) | (252, 2045, 188, 190) | x+4, y+20, w+11, h-25 |
 | 1 | (452, 2025, 176, 215) | (455, 2045, 188, 190) | x+3, y+20, w+12, h-25 |
@@ -53,13 +53,9 @@ Pixel-measured from actual Samsung A35 screenshot:
 | 3 | (858, 2025, 177, 215) | (860, 2045, 190, 190) | x+2, y+20, w+13, h-25 |
 | Next | (61, 2215, 79, 110) | (50, 2140, 115, 155) | bigger crop area |
 
-### Fix 5: Elixir cost OCR (lightweight secondary signal)
-- Crop the elixir badge region (y=2245-2310) from each card
-- Use ML Kit on-device text recognition (already bundled in most Android apps)
-- Read single digit (1-10) from pink circle with white text
-- Narrows candidates: if OCR reads "5", only Giant matches from 8-card deck
-- **Zero network latency** (on-device)
-- Falls back to pHash-only if OCR fails
+### Optional Idea (Not Implemented): Elixir Digit OCR
+This is a possible future fallback if pHash ever becomes ambiguous:
+- OCR the elixir badge digit (1-10) and use it to narrow candidates within the 8-card deck.
 
 ## Results After Fixes
 
@@ -100,5 +96,4 @@ Pixel-measured from actual Samsung A35 screenshot:
 ## Performance Impact
 - 32x32 hash: ~0.1ms extra per card (negligible)
 - HSV histogram: ~0.2ms per card (computed alongside color hash)
-- Elixir OCR: ~10-20ms per frame (ML Kit on-device, run on separate thread)
-- **Total: <25ms per frame** (well within 200ms scan interval)
+- **Total: well within 200ms scan interval** (device-dependent)
