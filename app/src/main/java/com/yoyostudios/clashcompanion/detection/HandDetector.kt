@@ -37,8 +37,9 @@ import java.util.concurrent.TimeUnit
  * button in overlay, captures live screenshot and uses AI to identify cards.
  *
  * Key design:
- *  - COLOR hashes (768 values = 16x16x3 RGB) for maximum discrimination
- *  - Per-channel normalization → handles brightness changes
+ *  - COLOR hashes (3072 values = 32x32x3 RGB) for maximum discrimination
+ *  - HSV histogram fusion → illumination-invariant color distribution matching
+ *  - CDN art composited on BLACK background → matches dark in-game card frames
  *  - Normal + desaturated templates → handles dim cards (low elixir)
  *  - <5ms per scan at 5 FPS → negligible CPU cost
  *  - Pure Kotlin math → zero dependencies
@@ -47,9 +48,19 @@ import java.util.concurrent.TimeUnit
 object HandDetector {
 
     private const val TAG = "ClashCompanion"
-    private const val HASH_SIZE = 16
+    private const val HASH_SIZE = 32
     private const val HASH_CHANNELS = 3 // R, G, B
-    private const val HASH_LEN = HASH_SIZE * HASH_SIZE * HASH_CHANNELS // 768 floats
+    private const val HASH_LEN = HASH_SIZE * HASH_SIZE * HASH_CHANNELS // 3072 floats
+
+    // HSV histogram parameters
+    private const val HUE_BINS = 24
+    private const val SAT_BINS = 12
+    private const val VAL_BINS = 12
+    private const val HIST_LEN = HUE_BINS + SAT_BINS + VAL_BINS // 48 floats
+
+    // Fusion weights: color similarity vs HSV histogram similarity
+    private const val COLOR_WEIGHT = 0.6f
+    private const val HSV_WEIGHT = 0.4f
     private const val TEMPLATES_DIR = "phash_templates_rgb"
     // Low threshold — cosine similarity returns 0-1, most values will be 0.8+
     // Rely on relative ranking (highest wins among 8 candidates)
@@ -60,11 +71,17 @@ object HandDetector {
 
     // ── State ───────────────────────────────────────────────────────────
 
-    /** Normal template storage: cardName → normalized 16×16 RGB (768 floats) */
+    /** Normal template storage: cardName → 32×32 RGB (3072 floats) */
     private val templates = mutableMapOf<String, FloatArray>()
 
-    /** Desaturated template storage: cardName → normalized 16×16 RGB of dimmed card */
+    /** Desaturated template storage: cardName → 32×32 RGB of dimmed card */
     private val dimTemplates = mutableMapOf<String, FloatArray>()
+
+    /** HSV histogram templates: cardName → HSV histogram (48 floats) */
+    private val hsvTemplates = mutableMapOf<String, FloatArray>()
+
+    /** Desaturated HSV histogram templates */
+    private val dimHsvTemplates = mutableMapOf<String, FloatArray>()
 
     /**
      * Current hand state: slotIndex → cardName.
@@ -103,11 +120,11 @@ object HandDetector {
     // ── Core Color Hash Functions ─────────────────────────────────────
 
     /**
-     * Downsample a bitmap to 16×16 COLOR (RGB) float array.
-     * Returns 768 floats: [R0, G0, B0, R1, G1, B1, ...] for each pixel.
-     * Color provides 3x more discriminating features than greyscale.
+     * Downsample a bitmap to 32×32 COLOR (RGB) float array.
+     * Returns 3072 floats: [R0, G0, B0, R1, G1, B1, ...] for each pixel.
+     * 32x32 provides 4x more spatial features than 16x16, with minimal cost.
      */
-    fun toColor16x16(bitmap: Bitmap): FloatArray {
+    fun toColorHash(bitmap: Bitmap): FloatArray {
         val scaled = Bitmap.createScaledBitmap(bitmap, HASH_SIZE, HASH_SIZE, true)
         val result = FloatArray(HASH_LEN)
         for (y in 0 until HASH_SIZE) {
@@ -121,6 +138,71 @@ object HandDetector {
         }
         if (scaled !== bitmap) scaled.recycle()
         return result
+    }
+
+    // Keep old name as alias for backward compat with Gemini calibration
+    fun toColor16x16(bitmap: Bitmap): FloatArray = toColorHash(bitmap)
+
+    /**
+     * Compute HSV histogram from a bitmap.
+     * Returns 48 floats: [24 hue bins, 12 saturation bins, 12 value bins].
+     * Illumination-invariant — handles brightness changes better than raw RGB.
+     * Hue bins weighted 2x for emphasis on color identity.
+     */
+    fun toHsvHistogram(bitmap: Bitmap): FloatArray {
+        val scaled = Bitmap.createScaledBitmap(bitmap, HASH_SIZE, HASH_SIZE, true)
+        val hHist = FloatArray(HUE_BINS)
+        val sHist = FloatArray(SAT_BINS)
+        val vHist = FloatArray(VAL_BINS)
+
+        var chromaPixels = 0
+
+        for (y in 0 until HASH_SIZE) {
+            for (x in 0 until HASH_SIZE) {
+                val pixel = scaled.getPixel(x, y)
+                val r = ((pixel shr 16) and 0xFF) / 255f
+                val g = ((pixel shr 8) and 0xFF) / 255f
+                val b = (pixel and 0xFF) / 255f
+
+                val maxC = maxOf(r, g, b)
+                val minC = minOf(r, g, b)
+                val diff = maxC - minC
+
+                // Value histogram (always counted)
+                val vBin = (maxC * (VAL_BINS - 1)).toInt().coerceIn(0, VAL_BINS - 1)
+                vHist[vBin]++
+
+                // Only count hue/sat for chromatic pixels
+                if (diff > 0.01f) {
+                    chromaPixels++
+
+                    // Hue [0, 6) → normalized to [0, 1)
+                    val hue = when (maxC) {
+                        r -> ((g - b) / diff).let { if (it < 0) it + 6 else it }
+                        g -> (b - r) / diff + 2
+                        else -> (r - g) / diff + 4
+                    } / 6f
+
+                    val sat = diff / maxC
+
+                    val hBin = (hue * HUE_BINS).toInt().coerceIn(0, HUE_BINS - 1)
+                    val sBin = (sat * (SAT_BINS - 1)).toInt().coerceIn(0, SAT_BINS - 1)
+                    hHist[hBin]++
+                    sHist[sBin]++
+                }
+            }
+        }
+
+        if (scaled !== bitmap) scaled.recycle()
+
+        // Normalize each histogram to sum=1, weight hue 2x
+        val totalPixels = (HASH_SIZE * HASH_SIZE).toFloat()
+        val chromaTotal = chromaPixels.toFloat().coerceAtLeast(1f)
+        for (i in hHist.indices) hHist[i] = (hHist[i] / chromaTotal) * 2f
+        for (i in sHist.indices) sHist[i] = sHist[i] / chromaTotal
+        for (i in vHist.indices) vHist[i] = vHist[i] / totalPixels
+
+        return hHist + sHist + vHist
     }
 
     /**
@@ -238,16 +320,16 @@ object HandDetector {
     }
 
     /**
-     * Compute the color hash for a card slot: crop → 16×16 RGB → per-channel normalize.
-     * Returns the normalized color hash (768 floats), or null if crop fails.
+     * Compute color hash + HSV histogram for a card slot.
+     * Returns Pair(colorHash, hsvHistogram), or null if crop fails.
      * Recycles the crop immediately.
      */
-    fun hashSlot(frame: Bitmap, slotIndex: Int): FloatArray? {
+    fun hashSlot(frame: Bitmap, slotIndex: Int): Pair<FloatArray, FloatArray>? {
         val crop = cropCardSlot(frame, slotIndex) ?: return null
-        val hash = toColor16x16(crop)
+        val colorHash = toColorHash(crop)
+        val hsvHist = toHsvHistogram(crop)
         crop.recycle()
-        // No normalization — raw RGB values, compared via cosine similarity
-        return hash
+        return Pair(colorHash, hsvHist)
     }
 
     // ── CDN Template Loading (Primary) ────────────────────────────────
@@ -300,27 +382,32 @@ object HandDetector {
                         return@async null
                     }
 
-                    // Handle PNG transparency: draw onto opaque white canvas
+                    // Handle PNG transparency: draw onto opaque BLACK canvas.
+                    // BLACK matches in-game dark card frame — critical for accuracy.
+                    // WHITE caused Arrows (sky-blue CDN bg) to false-match everything.
                     if (bitmap.hasAlpha()) {
                         val opaque = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
                         Canvas(opaque).apply {
-                            drawColor(Color.WHITE)
+                            drawColor(Color.BLACK)
                             drawBitmap(bitmap, 0f, 0f, null)
                         }
                         bitmap.recycle()
                         bitmap = opaque
                     }
 
-                    // Compute color hash (normal) — raw RGB, no normalization
-                    val normalHash = toColor16x16(bitmap)
+                    // Compute color hash (normal) — raw RGB, 32x32
+                    val normalHash = toColorHash(bitmap)
+                    val normalHsv = toHsvHistogram(bitmap)
 
                     // Compute color hash (desaturated — for dimmed/low-elixir cards)
                     val dimBitmap = desaturate(bitmap)
                     bitmap.recycle()
-                    val dimHash = toColor16x16(dimBitmap)
+                    val dimHash = toColorHash(dimBitmap)
+                    val dimHsv = toHsvHistogram(dimBitmap)
                     dimBitmap.recycle()
 
-                    Triple(card.name, normalHash, dimHash)
+                    // Return 5 arrays: name, normalHash, dimHash, normalHsv, dimHsv
+                    listOf(card.name, normalHash, dimHash, normalHsv, dimHsv)
                 } catch (e: Exception) {
                     Log.w(TAG, "PHASH: Failed to download CDN art for '${card.name}': ${e.message}")
                     null
@@ -331,9 +418,13 @@ object HandDetector {
         // Collect results
         var loaded = 0
         for (deferred in results) {
-            val result = deferred.await() ?: continue
-            templates[result.first] = result.second
-            dimTemplates[result.first] = result.third
+            @Suppress("UNCHECKED_CAST")
+            val result = deferred.await() as? List<Any> ?: continue
+            val name = result[0] as String
+            templates[name] = result[1] as FloatArray
+            dimTemplates[name] = result[2] as FloatArray
+            hsvTemplates[name] = result[3] as FloatArray
+            dimHsvTemplates[name] = result[4] as FloatArray
             loaded++
         }
 
@@ -470,10 +561,11 @@ Use EXACT card names from the deck list above. No other text.
                 continue
             }
 
-            // Re-crop this slot and compute pHash template
-            val hash = hashSlot(frame, slotIndex)
-            if (hash != null) {
-                templates[cardName] = hash
+            // Re-crop this slot and compute pHash + HSV template
+            val hashes = hashSlot(frame, slotIndex)
+            if (hashes != null) {
+                templates[cardName] = hashes.first
+                hsvTemplates[cardName] = hashes.second
                 alreadyCalibrated.add(cardName)
                 calibrated++
                 Log.i(TAG, "PHASH: Calibrated '$cardName' from slot $slotIndex (${templates.size} total)")
@@ -505,47 +597,58 @@ Use EXACT card names from the deck list above. No other text.
     fun scanHand(frame: Bitmap, deckCards: List<String>): Map<Int, String> {
         if (templates.isEmpty()) return emptyMap()
 
-        // No frame.copy() needed — ScreenCaptureService keeps the previous frame
-        // alive for one extra capture cycle (delayed recycling), so the frame
-        // won't be recycled while we're cropping.
-        // Score all (slot, card) pairs
-        data class Match(val slot: Int, val card: String, val correlation: Float)
+        // Score all (slot, card) pairs using FUSED scoring
+        data class Match(val slot: Int, val card: String, val fusedScore: Float,
+                         val colorSim: Float, val hsvSim: Float)
         val allMatches = mutableListOf<Match>()
 
         for (slot in 0..4) {
-            val hash = hashSlot(frame, slot) ?: continue
+            val hashes = hashSlot(frame, slot) ?: continue
+            val (colorHash, hsvHist) = hashes
             val threshold = if (slot == 4) MIN_CORRELATION_NEXT else MIN_CORRELATION
 
             for (cardName in deckCards) {
-                val normalTemplate = templates[cardName] ?: continue
-                val dimTemplate = dimTemplates[cardName]
+                val normalColor = templates[cardName] ?: continue
+                val dimColor = dimTemplates[cardName]
+                val normalHsv = hsvTemplates[cardName]
+                val dimHsv = dimHsvTemplates[cardName]
 
                 // Check both normal and desaturated templates, take the best
-                val corrNormal = cosineSimilarity(hash, normalTemplate)
-                val corrDim = if (dimTemplate != null) cosineSimilarity(hash, dimTemplate) else corrNormal
-                val corr = maxOf(corrNormal, corrDim)
+                val colorNormal = cosineSimilarity(colorHash, normalColor)
+                val colorDim = if (dimColor != null) cosineSimilarity(colorHash, dimColor) else colorNormal
+                val bestColor = maxOf(colorNormal, colorDim)
 
-                if (corr > threshold) {
-                    allMatches.add(Match(slot, cardName, corr))
+                val hsvNormal = if (normalHsv != null) cosineSimilarity(hsvHist, normalHsv) else 0f
+                val hsvDim = if (dimHsv != null) cosineSimilarity(hsvHist, dimHsv) else hsvNormal
+                val bestHsv = maxOf(hsvNormal, hsvDim)
+
+                // Fused score: color spatial similarity + HSV distribution similarity
+                val fused = COLOR_WEIGHT * bestColor + HSV_WEIGHT * bestHsv
+
+                if (fused > threshold) {
+                    allMatches.add(Match(slot, cardName, fused, bestColor, bestHsv))
                 }
             }
         }
 
-        // Diagnostic: log best match per slot so we can see actual correlation values
+        // Diagnostic: log best match per slot
         for (slot in 0..4) {
-            val slotMatches = allMatches.filter { it.slot == slot }.sortedByDescending { it.correlation }
+            val slotMatches = allMatches.filter { it.slot == slot }.sortedByDescending { it.fusedScore }
             if (slotMatches.isNotEmpty()) {
                 val best = slotMatches[0]
                 val secondBest = slotMatches.getOrNull(1)
-                val margin = if (secondBest != null) best.correlation - secondBest.correlation else best.correlation
-                Log.d(TAG, "PHASH: Slot $slot -> ${best.card} (${String.format("%.3f", best.correlation)}) " +
+                val margin = if (secondBest != null) best.fusedScore - secondBest.fusedScore else best.fusedScore
+                Log.d(TAG, "PHASH: Slot $slot -> ${best.card} " +
+                        "(fused=${String.format("%.3f", best.fusedScore)} " +
+                        "color=${String.format("%.3f", best.colorSim)} " +
+                        "hsv=${String.format("%.3f", best.hsvSim)}) " +
                         "margin=${String.format("%.3f", margin)}" +
-                        if (secondBest != null) " 2nd=${secondBest.card}(${String.format("%.3f", secondBest.correlation)})" else "")
+                        if (secondBest != null) " 2nd=${secondBest.card}(${String.format("%.3f", secondBest.fusedScore)})" else "")
             }
         }
 
-        // Greedy assignment: best correlation first, no reuse
-        allMatches.sortByDescending { it.correlation }
+        // Greedy assignment: best fused score first, no reuse
+        allMatches.sortByDescending { it.fusedScore }
         val result = mutableMapOf<Int, String>()
         val usedSlots = mutableSetOf<Int>()
         val usedCards = mutableSetOf<String>()
@@ -555,7 +658,7 @@ Use EXACT card names from the deck list above. No other text.
             result[match.slot] = match.card
             usedSlots.add(match.slot)
             usedCards.add(match.card)
-            if (usedSlots.size == 5) break // All 5 slots filled
+            if (usedSlots.size == 5) break
         }
 
         // Atomic swap of hand state
@@ -642,8 +745,8 @@ Use EXACT card names from the deck list above. No other text.
     // ── Template Persistence ────────────────────────────────────────────
 
     /**
-     * Save all templates (normal + dim) to internal storage.
-     * Format per file: 4 bytes name length + name UTF-8 + 768 floats normal + 768 floats dim.
+     * Save all templates (normal + dim + HSV) to internal storage.
+     * Format per file: 4 bytes name length + name UTF-8 + color hashes + HSV histograms.
      */
     fun saveTemplates(context: Context) {
         try {
@@ -655,21 +758,27 @@ Use EXACT card names from the deck list above. No other text.
 
             for ((cardName, normalHash) in templates) {
                 val dimHash = dimTemplates[cardName] ?: normalHash
+                val normalHsv = hsvTemplates[cardName] ?: FloatArray(HIST_LEN)
+                val dimHsv = dimHsvTemplates[cardName] ?: normalHsv
                 val safeName = cardName.replace(Regex("[^a-zA-Z0-9]"), "_")
                 val file = File(dir, "$safeName.phash")
 
                 val nameBytes = cardName.toByteArray(Charsets.UTF_8)
-                val buffer = ByteBuffer.allocate(4 + nameBytes.size + HASH_LEN * 4 * 2)
-                    .order(ByteOrder.LITTLE_ENDIAN)
+                // color hashes (2 * HASH_LEN) + HSV histograms (2 * HIST_LEN)
+                val buffer = ByteBuffer.allocate(
+                    4 + nameBytes.size + (HASH_LEN * 2 + HIST_LEN * 2) * 4
+                ).order(ByteOrder.LITTLE_ENDIAN)
                 buffer.putInt(nameBytes.size)
                 buffer.put(nameBytes)
                 for (v in normalHash) buffer.putFloat(v)
                 for (v in dimHash) buffer.putFloat(v)
+                for (v in normalHsv) buffer.putFloat(v)
+                for (v in dimHsv) buffer.putFloat(v)
 
                 file.writeBytes(buffer.array())
             }
 
-            Log.i(TAG, "PHASH: Saved ${templates.size} templates (normal + dim)")
+            Log.i(TAG, "PHASH: Saved ${templates.size} templates (color + HSV, normal + dim)")
         } catch (e: Exception) {
             Log.e(TAG, "PHASH: Failed to save templates: ${e.message}", e)
         }
@@ -677,6 +786,7 @@ Use EXACT card names from the deck list above. No other text.
 
     /**
      * Load templates from internal storage.
+     * Handles both old format (color only) and new format (color + HSV).
      * @return Number of templates loaded
      */
     fun loadTemplates(context: Context): Int {
@@ -703,13 +813,29 @@ Use EXACT card names from the deck list above. No other text.
                     }
                     templates[cardName] = normalHash
 
-                    // Load dim hash if present (file might be old format)
+                    // Load dim hash if present
                     if (buffer.remaining() >= HASH_LEN * 4) {
                         val dimHash = FloatArray(HASH_LEN)
                         for (i in dimHash.indices) {
                             dimHash[i] = buffer.getFloat()
                         }
                         dimTemplates[cardName] = dimHash
+                    }
+
+                    // Load HSV histograms if present (new format)
+                    if (buffer.remaining() >= HIST_LEN * 4) {
+                        val normalHsv = FloatArray(HIST_LEN)
+                        for (i in normalHsv.indices) {
+                            normalHsv[i] = buffer.getFloat()
+                        }
+                        hsvTemplates[cardName] = normalHsv
+                    }
+                    if (buffer.remaining() >= HIST_LEN * 4) {
+                        val dimHsv = FloatArray(HIST_LEN)
+                        for (i in dimHsv.indices) {
+                            dimHsv[i] = buffer.getFloat()
+                        }
+                        dimHsvTemplates[cardName] = dimHsv
                     }
 
                     loaded++
@@ -719,7 +845,7 @@ Use EXACT card names from the deck list above. No other text.
             }
 
             if (loaded > 0) {
-                Log.i(TAG, "PHASH: Loaded $loaded templates from storage (color RGB)")
+                Log.i(TAG, "PHASH: Loaded $loaded templates from storage (color + HSV)")
             }
             return loaded
         } catch (e: Exception) {
@@ -734,6 +860,8 @@ Use EXACT card names from the deck list above. No other text.
     fun clearTemplates(context: Context? = null) {
         templates.clear()
         dimTemplates.clear()
+        hsvTemplates.clear()
+        dimHsvTemplates.clear()
         currentHand = emptyMap()
 
         context?.let {

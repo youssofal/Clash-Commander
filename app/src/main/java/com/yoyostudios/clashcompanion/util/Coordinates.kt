@@ -46,14 +46,18 @@ object Coordinates {
     data class CardSlotROI(val x: Int, val y: Int, val w: Int, val h: Int)
 
     // Reference ROI values (1080x2340 full-frame coordinates)
-    // Pixel-verified from in-game screenshot analysis on Samsung A35
+    // Pixel-verified from actual in-game screenshot on Samsung A35 (Feb 2026)
+    // ROI covers card ART area only — excludes card frame border and elixir badge.
+    // Elixir badge starts at y≈2240, so ROI ends at 2235 to avoid it.
+    // CDN art (character portrait) matches this region, not the full card.
     private val REF_CARD_ROIS = listOf(
-        CardSlotROI(248, 2025, 177, 215), // slot 0 (leftmost)
-        CardSlotROI(452, 2025, 176, 215), // slot 1
-        CardSlotROI(654, 2025, 177, 215), // slot 2
-        CardSlotROI(858, 2025, 177, 215), // slot 3 (rightmost)
+        CardSlotROI(252, 2045, 188, 190), // slot 0 (leftmost)
+        CardSlotROI(455, 2045, 188, 190), // slot 1
+        CardSlotROI(658, 2045, 188, 190), // slot 2
+        CardSlotROI(860, 2045, 190, 190), // slot 3 (rightmost)
     )
-    private val REF_NEXT_ROI = CardSlotROI(61, 2215, 79, 110)
+    // Next card is smaller, bottom-left corner. Larger ROI for better match.
+    private val REF_NEXT_ROI = CardSlotROI(50, 2140, 115, 155)
 
     /**
      * Get card slot ROIs scaled to actual frame dimensions.
