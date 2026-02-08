@@ -55,8 +55,13 @@ object HandDetector {
     // Rely on relative ranking (highest wins among 8 candidates)
     private const val MIN_CORRELATION = 0.5f
     private const val MIN_CORRELATION_NEXT = 0.5f
+    private const val MIN_MARGIN = 0.06f
+    private const val MIN_MARGIN_NEXT = 0.04f
     private const val SCAN_INTERVAL_MS = 200L // ~5 FPS
     private const val DESATURATION_AMOUNT = 0.7f // How much to desaturate for dim templates
+
+    // Temporal smoothing: reduces blink/animation noise in card portraits.
+    private const val EMA_ALPHA = 0.35f
 
     // ── State ───────────────────────────────────────────────────────────
 
@@ -99,36 +104,106 @@ object HandDetector {
     private var scanJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var consecutiveNullFrames = 0
+    private var emaDeckKey: String? = null
+    private var emaScores: Array<FloatArray>? = null
 
     // ── Core Color Hash Functions ─────────────────────────────────────
 
+    private data class WeightedSampleConfig(
+        val centerX: Float,
+        val centerY: Float,
+        val sigmaX: Float,
+        val sigmaY: Float,
+        val borderCutoff: Float,
+        val borderScale: Float,
+        val maskElixir: Boolean
+    )
+
+    // Emphasize the portrait region and downweight borders and the elixir badge.
+    // This reduces the domain gap between CDN art and in-game framed cards.
+    private val HAND_SAMPLE = WeightedSampleConfig(
+        centerX = 0.50f,
+        centerY = 0.45f,
+        sigmaX = 0.22f,
+        sigmaY = 0.25f,
+        borderCutoff = 0.08f,
+        borderScale = 0.15f,
+        maskElixir = true
+    )
+    private val NEXT_SAMPLE = WeightedSampleConfig(
+        centerX = 0.52f,
+        centerY = 0.45f,
+        sigmaX = 0.24f,
+        sigmaY = 0.27f,
+        borderCutoff = 0.10f,
+        borderScale = 0.20f,
+        maskElixir = true
+    )
+    private val CDN_SAMPLE = WeightedSampleConfig(
+        centerX = 0.50f,
+        centerY = 0.48f,
+        sigmaX = 0.26f,
+        sigmaY = 0.28f,
+        borderCutoff = 0.10f,
+        borderScale = 0.20f,
+        maskElixir = false
+    )
+
     /**
-     * Downsample a bitmap to 16×16 COLOR (RGB) float array.
-     * Returns 768 floats: [R0, G0, B0, R1, G1, B1, ...] for each pixel.
-     * Color provides 3x more discriminating features than greyscale.
+     * Weighted sampling hash for a bitmap:
+     * - Sample a 16x16 grid of pixels (no resize)
+     * - Apply a center-weighted mask
+     * - Downweight borders and (optionally) mask the elixir badge region
+     *
+     * Output is normalized (per-channel mean + L2) so cosineSimilarity is stable across brightness.
      */
-    fun toColor16x16(bitmap: Bitmap): FloatArray {
-        val scaled = Bitmap.createScaledBitmap(bitmap, HASH_SIZE, HASH_SIZE, true)
+    private fun weightedHash16x16(bitmap: Bitmap, config: WeightedSampleConfig): FloatArray {
         val result = FloatArray(HASH_LEN)
-        for (y in 0 until HASH_SIZE) {
-            for (x in 0 until HASH_SIZE) {
-                val pixel = scaled.getPixel(x, y)
-                val idx = (y * HASH_SIZE + x) * HASH_CHANNELS
-                result[idx] = ((pixel shr 16) and 0xFF).toFloat()     // R
-                result[idx + 1] = ((pixel shr 8) and 0xFF).toFloat()  // G
-                result[idx + 2] = (pixel and 0xFF).toFloat()           // B
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 1 || h <= 1) return result
+
+        val fallbackPixel = bitmap.getPixel(w / 2, h / 2)
+
+        for (gy in 0 until HASH_SIZE) {
+            for (gx in 0 until HASH_SIZE) {
+                val u = (gx + 0.5f) / HASH_SIZE
+                val v = (gy + 0.5f) / HASH_SIZE
+
+                val sx = (u * w).toInt().coerceIn(0, w - 1)
+                val sy = (v * h).toInt().coerceIn(0, h - 1)
+
+                val du = u - config.centerX
+                val dv = v - config.centerY
+                val wt = kotlin.math.exp(
+                    -((du * du) / (config.sigmaX * config.sigmaX) + (dv * dv) / (config.sigmaY * config.sigmaY))
+                ).toFloat()
+
+                val border = minOf(u, 1f - u, v, 1f - v)
+                val borderWt = if (border < config.borderCutoff) config.borderScale else 1f
+
+                val elixirWt = if (config.maskElixir && u < 0.35f && v > 0.72f) 0.05f else 1f
+                val wFinal = wt * borderWt * elixirWt
+
+                val pixel = if (config.maskElixir && elixirWt < 0.5f) fallbackPixel else bitmap.getPixel(sx, sy)
+
+                val idx = (gy * HASH_SIZE + gx) * HASH_CHANNELS
+                result[idx] = (((pixel shr 16) and 0xFF).toFloat()) * wFinal
+                result[idx + 1] = (((pixel shr 8) and 0xFF).toFloat()) * wFinal
+                result[idx + 2] = ((pixel and 0xFF).toFloat()) * wFinal
             }
         }
-        if (scaled !== bitmap) scaled.recycle()
+
+        normalizeByMean(result)
+        l2Normalize(result)
         return result
     }
 
     /**
-     * Per-channel normalization: subtract mean and divide by std for each RGB channel independently.
-     * This handles brightness changes (dimmed cards) while preserving color ratios.
-     * A dimmed card and a bright card of the same type produce similar normalized patterns.
+     * Mean normalization (per channel) + L2 normalize:
+     * reduces exposure/brightness differences while keeping values non-negative.
      */
-    fun normalize(data: FloatArray) {
+    private fun normalizeByMean(data: FloatArray) {
         val pixelCount = data.size / HASH_CHANNELS
         for (ch in 0 until HASH_CHANNELS) {
             var sum = 0f
@@ -136,19 +211,29 @@ object HandDetector {
                 sum += data[i * HASH_CHANNELS + ch]
             }
             val mean = sum / pixelCount
-
-            var variance = 0f
-            for (i in 0 until pixelCount) {
-                val diff = data[i * HASH_CHANNELS + ch] - mean
-                variance += diff * diff
-            }
-            val std = kotlin.math.sqrt((variance / pixelCount).toDouble()).toFloat()
-            if (std < 1e-6f) continue // Flat channel — skip
+            if (mean < 1e-6f) continue
 
             for (i in 0 until pixelCount) {
                 val idx = i * HASH_CHANNELS + ch
-                data[idx] = (data[idx] - mean) / std
+                data[idx] = data[idx] / mean
             }
+        }
+    }
+
+    private fun l2Normalize(data: FloatArray) {
+        var mag = 0f
+        for (v in data) mag += v * v
+        val denom = kotlin.math.sqrt(mag.toDouble()).toFloat()
+        if (denom < 1e-10f) return
+        for (i in data.indices) data[i] = data[i] / denom
+    }
+
+    private fun ensureNormalized(data: FloatArray) {
+        // Back-compat: older persisted templates were raw 0..255.
+        val max = data.maxOrNull() ?: 0f
+        if (max > 10f) {
+            normalizeByMean(data)
+            l2Normalize(data)
         }
     }
 
@@ -244,9 +329,9 @@ object HandDetector {
      */
     fun hashSlot(frame: Bitmap, slotIndex: Int): FloatArray? {
         val crop = cropCardSlot(frame, slotIndex) ?: return null
-        val hash = toColor16x16(crop)
+        val cfg = if (slotIndex == 4) NEXT_SAMPLE else HAND_SAMPLE
+        val hash = weightedHash16x16(crop, cfg)
         crop.recycle()
-        // No normalization — raw RGB values, compared via cosine similarity
         return hash
     }
 
@@ -311,13 +396,13 @@ object HandDetector {
                         bitmap = opaque
                     }
 
-                    // Compute color hash (normal) — raw RGB, no normalization
-                    val normalHash = toColor16x16(bitmap)
+                    // Compute weighted hash (normal) — normalized for stable cosine
+                    val normalHash = weightedHash16x16(bitmap, CDN_SAMPLE)
 
                     // Compute color hash (desaturated — for dimmed/low-elixir cards)
                     val dimBitmap = desaturate(bitmap)
                     bitmap.recycle()
-                    val dimHash = toColor16x16(dimBitmap)
+                    val dimHash = weightedHash16x16(dimBitmap, CDN_SAMPLE)
                     dimBitmap.recycle()
 
                     Triple(card.name, normalHash, dimHash)
@@ -393,7 +478,7 @@ object HandDetector {
 You identify Clash Royale cards from screenshot crops of a player's hand.
 The player's deck contains EXACTLY these ${deckCards.size} cards: $deckList.
 You see $slotCount images. Images 1-4 are the visible hand cards (left to right).
-Image 5 (if present) is the smaller "next card" preview at the right edge.
+Image 5 (if present) is the smaller "next card" preview near the bottom-left "Next:" label.
 Cards may appear dimmed or greyed out (insufficient elixir) — still identify them.
 Respond ONLY with a JSON array of card names in the EXACT order of the images.
 Use EXACT card names from the deck list above. No other text.
@@ -474,6 +559,7 @@ Use EXACT card names from the deck list above. No other text.
             val hash = hashSlot(frame, slotIndex)
             if (hash != null) {
                 templates[cardName] = hash
+                dimTemplates[cardName] = hash
                 alreadyCalibrated.add(cardName)
                 calibrated++
                 Log.i(TAG, "PHASH: Calibrated '$cardName' from slot $slotIndex (${templates.size} total)")
@@ -508,55 +594,90 @@ Use EXACT card names from the deck list above. No other text.
         // No frame.copy() needed — ScreenCaptureService keeps the previous frame
         // alive for one extra capture cycle (delayed recycling), so the frame
         // won't be recycled while we're cropping.
-        // Score all (slot, card) pairs
-        data class Match(val slot: Int, val card: String, val correlation: Float)
-        val allMatches = mutableListOf<Match>()
 
+        data class Candidate(val card: String, val score: Float)
+
+        val candidatesBySlot = mutableMapOf<Int, List<Candidate>>()
+
+        // Initialize/reset EMA if deck changes.
+        val key = deckCards.joinToString("|")
+        if (emaDeckKey != key || emaScores == null || emaScores?.size != 5) {
+            emaDeckKey = key
+            emaScores = Array(5) { FloatArray(deckCards.size) { 0f } }
+        }
+        val ema = emaScores!!
+
+        // Score all slots (0..4) vs all deck cards using the weighted hash.
         for (slot in 0..4) {
             val hash = hashSlot(frame, slot) ?: continue
             val threshold = if (slot == 4) MIN_CORRELATION_NEXT else MIN_CORRELATION
+            val minMargin = if (slot == 4) MIN_MARGIN_NEXT else MIN_MARGIN
 
-            for (cardName in deckCards) {
+            // Update per-slot EMA for all 8 cards.
+            for ((i, cardName) in deckCards.withIndex()) {
                 val normalTemplate = templates[cardName] ?: continue
-                val dimTemplate = dimTemplates[cardName]
+                ensureNormalized(normalTemplate)
+                val dimTemplate = dimTemplates[cardName] ?: normalTemplate
+                ensureNormalized(dimTemplate)
 
-                // Check both normal and desaturated templates, take the best
                 val corrNormal = cosineSimilarity(hash, normalTemplate)
-                val corrDim = if (dimTemplate != null) cosineSimilarity(hash, dimTemplate) else corrNormal
+                val corrDim = cosineSimilarity(hash, dimTemplate)
                 val corr = maxOf(corrNormal, corrDim)
 
-                if (corr > threshold) {
-                    allMatches.add(Match(slot, cardName, corr))
+                val prev = ema[slot][i]
+                ema[slot][i] = if (prev == 0f) corr else (1f - EMA_ALPHA) * prev + EMA_ALPHA * corr
+            }
+
+            val scores = deckCards.mapIndexed { i, name -> Candidate(name, ema[slot][i]) }.toMutableList()
+            if (scores.isEmpty()) continue
+            scores.sortByDescending { it.score }
+            val best = scores[0]
+            val second = scores.getOrNull(1)
+            val margin = best.score - (second?.score ?: 0f)
+
+            Log.d(
+                TAG,
+                "PHASH: Slot $slot -> ${best.card} (${String.format(\"%.3f\", best.score)}) " +
+                        "margin=${String.format(\"%.3f\", margin)}" +
+                        if (second != null) " 2nd=${second.card}(${String.format(\"%.3f\", second.score)})" else \"\"
+            )
+
+            // Gate low-margin cases to prefer unknown over wrong.
+            if (best.score < threshold || margin < minMargin) continue
+
+            candidatesBySlot[slot] = scores.take(4)
+        }
+
+        // Brute-force best assignment with uniqueness (5 slots x 8 cards is tiny).
+        val slotsToAssign = candidatesBySlot.keys.sortedBy { candidatesBySlot[it]?.size ?: 0 }
+        var bestTotal = -1f
+        var bestAssign: Map<Int, String> = emptyMap()
+
+        fun dfs(idx: Int, used: MutableSet<String>, current: MutableMap<Int, String>, total: Float) {
+            if (idx >= slotsToAssign.size) {
+                if (total > bestTotal) {
+                    bestTotal = total
+                    bestAssign = current.toMap()
                 }
+                return
             }
-        }
-
-        // Diagnostic: log best match per slot so we can see actual correlation values
-        for (slot in 0..4) {
-            val slotMatches = allMatches.filter { it.slot == slot }.sortedByDescending { it.correlation }
-            if (slotMatches.isNotEmpty()) {
-                val best = slotMatches[0]
-                val secondBest = slotMatches.getOrNull(1)
-                val margin = if (secondBest != null) best.correlation - secondBest.correlation else best.correlation
-                Log.d(TAG, "PHASH: Slot $slot -> ${best.card} (${String.format("%.3f", best.correlation)}) " +
-                        "margin=${String.format("%.3f", margin)}" +
-                        if (secondBest != null) " 2nd=${secondBest.card}(${String.format("%.3f", secondBest.correlation)})" else "")
+            val slot = slotsToAssign[idx]
+            val cands = candidatesBySlot[slot] ?: emptyList()
+            for (cand in cands) {
+                if (cand.card in used) continue
+                used.add(cand.card)
+                current[slot] = cand.card
+                dfs(idx + 1, used, current, total + cand.score)
+                current.remove(slot)
+                used.remove(cand.card)
             }
+            // allow leaving a slot unknown
+            dfs(idx + 1, used, current, total)
         }
 
-        // Greedy assignment: best correlation first, no reuse
-        allMatches.sortByDescending { it.correlation }
-        val result = mutableMapOf<Int, String>()
-        val usedSlots = mutableSetOf<Int>()
-        val usedCards = mutableSetOf<String>()
+        dfs(0, mutableSetOf(), mutableMapOf(), 0f)
 
-        for (match in allMatches) {
-            if (match.slot in usedSlots || match.card in usedCards) continue
-            result[match.slot] = match.card
-            usedSlots.add(match.slot)
-            usedCards.add(match.card)
-            if (usedSlots.size == 5) break // All 5 slots filled
-        }
+        val result = bestAssign.toMutableMap()
 
         // Atomic swap of hand state
         currentHand = result.toMap()
@@ -632,6 +753,8 @@ Use EXACT card names from the deck list above. No other text.
     fun stopScanning() {
         scanJob?.cancel()
         scanJob = null
+        emaDeckKey = null
+        emaScores = null
         Log.i(TAG, "PHASH: Scanning stopped")
     }
 
