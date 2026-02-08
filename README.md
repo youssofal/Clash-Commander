@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Clash Commander Logo" width="150"/>
+</p>
+
 # Clash Commander
 
 **Play Clash Royale with your voice.** Five-tier AI command routing system combining on-device speech recognition, real-time computer vision, and cloud LLM strategic reasoning — running on a $300 mid-range Android phone.
