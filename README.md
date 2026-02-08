@@ -6,6 +6,14 @@ Built solo in 48 hours for the [Supercell Global AI Game Hack](https://ailab.sup
 
 ---
 
+## Download (Pre-Built APK)
+
+**[Download Clash Commander v1.0 APK](https://github.com/youssofal/Clash-Commander/releases/tag/v1.0.0)** (~457MB, includes all on-device models)
+
+Just install and play — no build required. Voice commands work fully offline. Cloud features (Smart Path, Autopilot) require API keys in `local.properties` if building from source.
+
+---
+
 ## What It Does
 
 Clash Commander is an Android overlay that sits on top of Clash Royale, listens to your voice, and plays cards for you. Say "knight left" and the card plays in under 200ms. Say "defend" and the AI picks the best defensive card. Say "autopilot" and the AI plays the entire match.
