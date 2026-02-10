@@ -1,5 +1,6 @@
 package com.yoyostudios.clashcompanion.command
 
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -7,6 +8,7 @@ import com.google.gson.JsonParser
 import com.yoyostudios.clashcompanion.accessibility.ClashCompanionAccessibilityService
 import com.yoyostudios.clashcompanion.BuildConfig
 import com.yoyostudios.clashcompanion.api.GeminiClient
+import com.yoyostudios.clashcompanion.capture.ScreenCaptureService
 import com.yoyostudios.clashcompanion.command.CommandParser.CommandTier
 import com.yoyostudios.clashcompanion.deck.DeckManager
 import com.yoyostudios.clashcompanion.detection.ArenaDetector
@@ -30,6 +32,9 @@ import kotlinx.coroutines.*
 object CommandRouter {
 
     private const val TAG = "ClashCompanion"
+
+    private const val VISION_ARENA_TARGET_W = 540
+    private const val VISION_ARENA_JPEG_QUALITY = 60
 
     /** Set by OverlayManager when overlay is shown */
     var overlay: OverlayManager? = null
@@ -289,12 +294,35 @@ object CommandRouter {
                 val result = withContext(Dispatchers.IO) {
                     val systemPrompt = buildSmartPrompt()
                     val userMessage = rawTranscript
-                    GeminiClient.chat(
-                        systemInstruction = systemPrompt,
-                        userMessage = userMessage,
-                        maxTokens = 256,
-                        jsonMode = true
-                    )
+
+                    // Use Gemini Vision for defense calls when possible.
+                    // This dramatically improves lane selection and timing without Roboflow.
+                    if (wantsDefenseVision(userMessage)) {
+                        val arenaImg = captureArenaImageBase64()
+                        if (arenaImg != null) {
+                            GeminiClient.chatWithImages(
+                                systemInstruction = systemPrompt,
+                                userText = "ARENA IMAGE PROVIDED. Use it to identify enemy threats and defend NOW.\n\n$userMessage",
+                                images = listOf(arenaImg),
+                                maxTokens = 256,
+                                jsonMode = true
+                            )
+                        } else {
+                            GeminiClient.chat(
+                                systemInstruction = systemPrompt,
+                                userMessage = userMessage,
+                                maxTokens = 256,
+                                jsonMode = true
+                            )
+                        }
+                    } else {
+                        GeminiClient.chat(
+                            systemInstruction = systemPrompt,
+                            userMessage = userMessage,
+                            maxTokens = 256,
+                            jsonMode = true
+                        )
+                    }
                 }
 
                 val elapsed = System.currentTimeMillis() - startMs
@@ -421,9 +449,12 @@ $arenaSection$lastPlayedSection
 
 VALID ZONES: left_bridge, right_bridge, center, behind_left, behind_right, back_center, front_left, front_right
 
+If an ARENA screenshot image is provided, use it as ground truth for threats and lane selection.
+Orientation: YOUR side is the BOTTOM of the screen. ENEMY side is the TOP.
+
 Rules:
 - ONLY suggest cards in CURRENT HAND.
-- When user says "defend" or "defense": ALWAYS play a defensive card immediately. Trust the user. Never return "wait". Use playbook defense_table. For TROOPS (Knight, Mini P.E.K.K.A, Musketeer, Archers), place at behind_left or behind_right — NEVER center. Only BUILDINGS (Cannon, Tesla) go at center. If user says "defend left", use behind_left. If "defend right", use behind_right. If just "defend", pick behind_left or behind_right.
+- When user says "defend" or "defense": ALWAYS play a defensive card immediately. Trust the user. Use ARENA STATE and/or the arena screenshot to find the most urgent enemy threat (closest to your towers) and choose the correct lane (left/right). If the threat is already on your side or about to cross, place closer (front_left/front_right/center). If the threat is further away, you can place behind_left/behind_right for a stronger counterpush. Buildings (if in deck) prefer center to pull. Troops MAY also be placed at center when needed to pull (e.g., Hog Rider).
 - When user says "push left" or "push right": play an offensive card at that bridge. Prefer win condition (Giant), then support troops (Musketeer, Archers), then cycle cards.
 - When user says "follow up": support LAST PLAYED card in the SAME LANE. Use playbook synergies (e.g. Giant + Musketeer, Giant + Archers). If last played was at left, play support at left. Never cross lanes for follow-up.
 - When user says "suggest" or gives a vague command: pick the best offensive play from current hand.
@@ -433,6 +464,57 @@ Rules:
 
 Respond ONLY with JSON: {"action":"play","card":"<exact card name>","zone":"<zone_key>","reasoning":"<15 words max>"}
 Or ONLY if user says wait: {"action":"wait","reasoning":"<15 words max>"}"""
+    }
+
+    private fun wantsDefenseVision(text: String): Boolean {
+        val t = text.lowercase()
+        return t.contains("defend") || t.contains("defense") || t.contains("defence")
+    }
+
+    /**
+     * Capture an arena screenshot suitable for Gemini vision.
+     *
+     * Returns a base64 JPEG (no data: prefix) or null if capture fails.
+     */
+    private fun captureArenaImageBase64(): String? {
+        val frame = ScreenCaptureService.getLatestFrame()
+        if (frame == null || frame.isRecycled) return null
+
+        // Copy immediately to avoid ScreenCaptureService recycling races.
+        val safeCopy = try {
+            frame.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "CMD: Arena frame copy failed: ${e.message}")
+            null
+        } ?: return null
+
+        try {
+            val top = Coordinates.ARENA_CROP_TOP
+            val bottom = Coordinates.ARENA_CROP_BOTTOM
+            val height = bottom - top
+            if (top < 0 || height <= 0 || top + height > safeCopy.height) return null
+
+            val crop = Bitmap.createBitmap(safeCopy, 0, top, safeCopy.width, height)
+
+            val targetW = VISION_ARENA_TARGET_W
+            val targetH = (crop.height.toFloat() * (targetW.toFloat() / crop.width.toFloat())).toInt()
+                .coerceAtLeast(1)
+            val scaled = if (crop.width != targetW) {
+                Bitmap.createScaledBitmap(crop, targetW, targetH, true)
+            } else {
+                crop
+            }
+            if (scaled !== crop) crop.recycle()
+
+            val base64 = GeminiClient.bitmapToBase64(scaled, quality = VISION_ARENA_JPEG_QUALITY)
+            scaled.recycle()
+            return base64
+        } catch (e: Exception) {
+            Log.w(TAG, "CMD: Arena image capture failed: ${e.message}")
+            return null
+        } finally {
+            safeCopy.recycle()
+        }
     }
 
     /**
@@ -514,15 +596,29 @@ Or ONLY if user says wait: {"action":"wait","reasoning":"<15 words max>"}"""
 
                     val result = withContext(Dispatchers.IO) {
                         val systemPrompt = buildSmartPrompt()
-                        GeminiClient.chat(
-                            systemInstruction = systemPrompt,
-                            userMessage = "AUTOPILOT: You MUST play a card NOW from your current hand. " +
-                                    "Never return wait — always play something. " +
-                                    "Prioritize: 1) Counter enemy threats. 2) Build pushes with synergies from the playbook. " +
-                                    "3) Cycle cheap cards (Knight, Archers) when no clear play. Always place cards — never idle.",
-                            maxTokens = 256,
-                            jsonMode = true
-                        )
+                        val userText = "AUTOPILOT: You MUST play a card NOW from your current hand. " +
+                                "Never return wait — always play something. " +
+                                "Use ARENA STATE and/or the arena screenshot to defend correctly. " +
+                                "Prioritize: 1) Counter enemy threats. 2) Build pushes with synergies from the playbook. " +
+                                "3) Cycle cheap cards (Knight, Archers) when no clear play. Always place cards — never idle."
+
+                        val arenaImg = captureArenaImageBase64()
+                        if (arenaImg != null) {
+                            GeminiClient.chatWithImages(
+                                systemInstruction = systemPrompt,
+                                userText = userText,
+                                images = listOf(arenaImg),
+                                maxTokens = 256,
+                                jsonMode = true
+                            )
+                        } else {
+                            GeminiClient.chat(
+                                systemInstruction = systemPrompt,
+                                userMessage = userText,
+                                maxTokens = 256,
+                                jsonMode = true
+                            )
+                        }
                     }
 
                     val elapsed = System.currentTimeMillis() - startMs

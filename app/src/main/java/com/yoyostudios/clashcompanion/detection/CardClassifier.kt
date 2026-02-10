@@ -49,6 +49,16 @@ object CardClassifier {
     /** Whether the model is loaded and ready */
     val isReady: Boolean get() = module != null && idx2key.isNotEmpty()
 
+    /** All card keys supported by the on-device model (DeckManager `key` format). */
+    fun supportedKeys(): Set<String> = idx2key.values.toSet()
+
+    /** Deck cards that are NOT supported by the on-device model. */
+    fun unsupportedDeckCards(deck: List<DeckManager.CardInfo>): List<DeckManager.CardInfo> {
+        if (!isReady) return deck
+        val supported = supportedKeys()
+        return deck.filter { it.key !in supported }
+    }
+
     /**
      * Load the model and class mapping from assets. Call once at startup.
      */

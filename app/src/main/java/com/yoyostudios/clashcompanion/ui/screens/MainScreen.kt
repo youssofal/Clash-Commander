@@ -60,6 +60,7 @@ fun MainScreen(activity: MainActivity) {
     val speechReady by activity.speechReady
     val speechLoading by activity.speechLoading
     val deck by activity.deckCards
+    val deckModelWarning by activity.deckModelWarning
     val opusStatus by activity.opusStatus
     val opusComplete by activity.opusComplete
 
@@ -197,6 +198,7 @@ fun MainScreen(activity: MainActivity) {
             } else {
                 DeckCard(
                     cards = deck,
+                    modelWarning = deckModelWarning,
                     opusStatus = opusStatus,
                     opusComplete = opusComplete
                 )
@@ -337,6 +339,7 @@ private fun DeckEmptyCard() {
 @Composable
 private fun DeckCard(
     cards: List<DeckManager.CardInfo>,
+    modelWarning: String?,
     opusStatus: String,
     opusComplete: Boolean
 ) {
@@ -390,6 +393,17 @@ private fun DeckCard(
                 bottomRow.forEach { card ->
                     CardTile(card = card, modifier = Modifier.weight(1f))
                 }
+            }
+
+            // Model support warning (only shown when deck contains unsupported cards)
+            if (!modelWarning.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = modelWarning,
+                    style = CrTypography.labelSmall,
+                    color = CrColors.Error,
+                    lineHeight = 14.sp
+                )
             }
 
             // Opus status inside deck card
