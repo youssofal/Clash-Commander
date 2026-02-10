@@ -107,15 +107,29 @@ object CardClassifier {
         val rois = Coordinates.getCardSlotROIs(frame.width, frame.height)
         val nextRoi = Coordinates.getNextCardROI(frame.width, frame.height)
 
+        fun norm(s: String): String =
+            s.lowercase().replace(Regex("""[^a-z0-9]"""), "")
+
         // Build deck-only index mapping: find which output indices correspond to deck cards
         // This restricts classification to ONLY the 8 deck cards instead of all 103
         val deckIndices = mutableListOf<Pair<Int, String>>() // (model output index, DeckManager name)
         for (card in DeckManager.currentDeck) {
+            val wantKey = card.key
+            val wantKeyNorm = norm(card.key)
+            val wantNameNorm = norm(card.name)
+
+            var matchedIdx: Int? = null
             for ((idx, key) in idx2key) {
-                if (key == card.key) {
-                    deckIndices.add(idx to card.name)
+                val keyNorm = norm(key)
+                if (key == wantKey || keyNorm == wantKeyNorm || keyNorm == wantNameNorm) {
+                    matchedIdx = idx
                     break
                 }
+            }
+            if (matchedIdx != null) {
+                deckIndices.add(matchedIdx to card.name)
+            } else {
+                Log.w(TAG, "CARD-ML: Deck card not in model classes: '${card.name}' key='${card.key}'")
             }
         }
 

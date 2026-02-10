@@ -241,11 +241,13 @@ class MainActivity : ComponentActivity() {
             else -> null
         }
         if (cards != null && cards.isNotEmpty()) {
-            // New deck loaded — stop any existing scanning
-            HandDetector.stopScanning()
-
             DeckManager.setDeck(cards, this)
             deckCards.value = cards
+
+            // If the STT engine is already running, reload hotwords so recognition
+            // matches the newly loaded deck without requiring a full service restart.
+            SpeechService.instance?.reloadHotwords()
+
             triggerOpusAnalysis(cards)
             Log.i(TAG, "DECK: Loaded ${cards.size} cards. ResNet classifier ready.")
         }
