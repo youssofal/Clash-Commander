@@ -220,13 +220,18 @@ object DeckManager {
      */
     private fun writeDeckHotwords(context: Context, cards: List<CardInfo>) {
         try {
+            fun norm(s: String): String =
+                s.lowercase().replace(Regex("""[^a-z0-9]"""), "")
+
             val deckNames = cards.map { it.name.uppercase() }.toSet()
+            val deckNorms = cards.map { norm(it.name) }.toSet()
 
             // Read base hotwords from assets
             val baseLines = context.assets.open("hotwords.txt")
                 .bufferedReader().use { it.readLines() }
 
             val sb = StringBuilder()
+            val seenNorms = mutableSetOf<String>()
             for (line in baseLines) {
                 val trimmed = line.trim()
                 if (trimmed.isBlank()) continue
@@ -234,15 +239,24 @@ object DeckManager {
                 if (colonIdx < 0) { sb.appendLine(trimmed); continue }
 
                 val word = trimmed.substring(0, colonIdx).trim()
+                val wordNorm = norm(word)
+                seenNorms.add(wordNorm)
 
-                // Check if this hotword matches any deck card name
-                val isDeckCard = deckNames.any { deckName ->
-                    word == deckName || deckName.contains(word) || word.contains(deckName)
-                }
+                // Check if this hotword matches a deck card EXACTLY (normalized).
+                // Avoid substring matching: "KNIGHT" deck would otherwise boost "MEGA KNIGHT".
+                val isDeckCard = deckNorms.contains(wordNorm)
 
                 // Deck cards: strong boost (6.0). Non-deck: minimal (1.0)
                 val weight = if (isDeckCard) 6.0f else 1.0f
                 sb.appendLine("$word :$weight")
+            }
+
+            // Ensure every deck card name is present even if missing from base hotwords.txt
+            for (deckName in deckNames) {
+                val deckNorm = norm(deckName)
+                if (!seenNorms.contains(deckNorm)) {
+                    sb.appendLine("$deckName :6.0")
+                }
             }
 
             val file = java.io.File(context.filesDir, DECK_HOTWORDS_FILE)

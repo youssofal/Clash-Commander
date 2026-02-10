@@ -42,6 +42,8 @@ class SpeechService : Service() {
     @Volatile
     private var isListening = false
     private var isModelLoaded = false
+    @Volatile
+    private var isReloadingHotwords = false
 
     // Callback for transcript results - set by OverlayManager
     var onTranscript: ((text: String, latencyMs: Long) -> Unit)? = null
@@ -146,6 +148,97 @@ class SpeechService : Service() {
             Log.e(TAG, "STT: Model load failed: ${e.message}", e)
             handler.post {
                 onTranscript?.invoke("[ERROR: Model load failed: ${e.message}]", 0)
+            }
+        }
+    }
+
+    /**
+     * Reload deck hotwords at runtime (after the user shares a new deck).
+     *
+     * sherpa-onnx hotwords are baked into the recognizer config, so we rebuild the
+     * OfflineRecognizer with the new hotwords file. This is fast enough for deck changes
+     * and avoids requiring a full app restart.
+     */
+    fun reloadHotwords() {
+        if (!isModelLoaded) {
+            Log.w(TAG, "STT: reloadHotwords ignored — models not loaded yet")
+            return
+        }
+        if (isReloadingHotwords) {
+            Log.w(TAG, "STT: reloadHotwords ignored — reload already in progress")
+            return
+        }
+
+        thread(name = "STT-ReloadHotwords") {
+            isReloadingHotwords = true
+            val wasListening = isListening
+            try {
+                Log.i(TAG, "STT: Reloading hotwords (wasListening=$wasListening)...")
+
+                if (wasListening) {
+                    stopListening()
+                }
+
+                val filesDir = application.filesDir.absolutePath
+
+                val deckHotwords = java.io.File(
+                    application.filesDir,
+                    com.yoyostudios.clashcompanion.deck.DeckManager.DECK_HOTWORDS_FILE
+                )
+                val hotwordsPath = if (deckHotwords.exists()) {
+                    deckHotwords.absolutePath
+                } else {
+                    "$filesDir/hotwords.txt"
+                }
+
+                // Rebuild recognizer with new hotwords. Keep the old recognizer alive until
+                // the new one is successfully created to avoid breaking STT on failure.
+                val oldRecognizer = offlineRecognizer
+
+                val modelDir = "$filesDir/sherpa-onnx-zipformer-en-2023-04-01"
+                val recognizerConfig = OfflineRecognizerConfig(
+                    featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+                    modelConfig = OfflineModelConfig(
+                        transducer = OfflineTransducerModelConfig(
+                            encoder = "$modelDir/encoder-epoch-99-avg-1.int8.onnx",
+                            decoder = "$modelDir/decoder-epoch-99-avg-1.int8.onnx",
+                            joiner = "$modelDir/joiner-epoch-99-avg-1.int8.onnx",
+                        ),
+                        tokens = "$modelDir/tokens.txt",
+                        numThreads = 2,
+                        debug = false,
+                        provider = "cpu",
+                        modelingUnit = "bpe",
+                        bpeVocab = "$modelDir/bpe.vocab",
+                    ),
+                    decodingMethod = "modified_beam_search",
+                    maxActivePaths = 4,
+                    hotwordsFile = hotwordsPath,
+                    hotwordsScore = 2.0f,
+                )
+                val newRecognizer = OfflineRecognizer(config = recognizerConfig)
+                offlineRecognizer = newRecognizer
+                oldRecognizer?.release()
+
+                Log.i(TAG, "STT: Hotwords reloaded from $hotwordsPath")
+                handler.post {
+                    onTranscript?.invoke("[Hotwords updated]", 0)
+                }
+
+                if (wasListening) {
+                    startListening()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "STT: Hotwords reload failed: ${e.message}", e)
+                handler.post {
+                    onTranscript?.invoke("[ERROR: Hotwords reload failed: ${e.message}]", 0)
+                }
+                if (wasListening) {
+                    // Best-effort: resume listening using the previous recognizer.
+                    startListening()
+                }
+            } finally {
+                isReloadingHotwords = false
             }
         }
     }
